@@ -51,20 +51,18 @@ impl ApiClient {
     {
       let client = ApiClient::new(token.clone(), url.clone().unwrap_or(config.app_url.clone()));
 
-      if let Ok(valid) = client.test_token().await {
-        if valid {
-          return client;
-        } else {
-          warn!("Token is invalid.");
-        }
-      } else {
-        warn!("Failed to validate token.");
+      match client.test_token().await {
+        Ok(true) => return client,
+        Ok(false) => warn!("Token is invalid."),
+        Err(e) => warn!("Failed to validate token: {e:#}"),
       }
     }
 
     let tty = std::io::stdin().is_terminal();
     if !tty {
-      if url.is_some() {
+      if config.as_ref().is_some_and(|c| c.token.is_some()) {
+        error!("Token validation failed. Re-run \"hibernation auth\" if the token is invalid");
+      } else if url.is_some() {
         error!("Token not set. Please use \"hibernation auth\" first");
       } else {
         error!("Cli not configured. Please login with \"hibernation auth --url <url>\" first");
