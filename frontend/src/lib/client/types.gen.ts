@@ -360,6 +360,11 @@ export type TokenViewPath = {
   uuid: string;
 };
 
+export type UploadChunkPath = {
+  part: number;
+  uuid: string;
+};
+
 export type UploadFinishRequest = {
   file_hash: string;
   file_size: number;
@@ -376,10 +381,6 @@ export type UploadInfoResponse = {
   paths: Array<string>;
 };
 
-export type UploadNarPath = {
-  uuid: string;
-};
-
 export type UploadPathRequest = {
   cache: string;
   deriver?: string | null;
@@ -392,6 +393,10 @@ export type UploadPathRequest = {
 };
 
 export type UploadPathResponse = {
+  /**
+   * The NAR already exists on the server, no chunks need to be uploaded
+   */
+  nar_found: boolean;
   uuid: string;
 };
 
@@ -2169,16 +2174,17 @@ export type UploadPathResponses = {
 export type UploadPathResponse2 =
   UploadPathResponses[keyof UploadPathResponses];
 
-export type UploadNarData = {
+export type UploadChunkData = {
   body?: never;
   path: {
+    part: number;
     uuid: string;
   };
   query?: never;
-  url: '/api/cache/push/{uuid}';
+  url: '/api/cache/push/{uuid}/{part}';
 };
 
-export type UploadNarErrors = {
+export type UploadChunkErrors = {
   /**
    * An error occurred
    */
@@ -2189,7 +2195,7 @@ export type UploadNarErrors = {
   '5XX': unknown;
 };
 
-export type UploadNarResponses = {
+export type UploadChunkResponses = {
   /**
    * no content
    */

@@ -2,6 +2,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Size of a single NAR upload chunk
+pub const CHUNK_SIZE: usize = 32 * 1024 * 1024;
+
 #[derive(Deserialize, Serialize, JsonSchema)]
 pub struct UploadInfoRequest {
   pub cache: String,
@@ -30,6 +33,8 @@ pub struct UploadPathRequest {
 #[derive(Serialize, Deserialize, JsonSchema)]
 pub struct UploadPathResponse {
   pub uuid: Uuid,
+  /// The NAR already exists on the server, no chunks need to be uploaded
+  pub nar_found: bool,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]

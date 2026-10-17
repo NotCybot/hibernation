@@ -2,7 +2,7 @@ use std::{io::IsTerminal, path::PathBuf};
 
 use bytes::Bytes;
 use centaurus::{VERSION_HEADER_NAME, error::Result, eyre::Context};
-use reqwest::{Body, Client, Method, RequestBuilder, Response};
+use reqwest::{Client, Method, RequestBuilder, Response};
 use serde::Deserialize;
 use shared::api::push::{
   UploadFinishRequest, UploadInfoResponse, UploadPathRequest, UploadPathResponse,
@@ -166,15 +166,10 @@ impl ApiClient {
     Ok(res)
   }
 
-  pub async fn upload_nar<S>(&self, upload_id: Uuid, stream: S) -> Result<()>
-  where
-    S: futures_core::stream::TryStream + Send + 'static,
-    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    Bytes: From<S::Ok>,
-  {
+  pub async fn upload_chunk(&self, upload_id: Uuid, part: u32, chunk: Bytes) -> Result<()> {
     self
-      .req(&format!("/api/cache/push/{}", upload_id), Method::POST)?
-      .body(Body::wrap_stream(stream))
+      .req(&format!("/api/cache/push/{upload_id}/{part}"), Method::POST)?
+      .body(chunk)
       .send()
       .await?
       .error_for_status()?;

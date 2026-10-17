@@ -182,15 +182,15 @@ import type {
   UpdatePasswordData,
   UpdatePasswordErrors,
   UpdatePasswordResponses,
+  UploadChunkData,
+  UploadChunkErrors,
+  UploadChunkResponses,
   UploadFinishData,
   UploadFinishErrors,
   UploadFinishResponses,
   UploadInfoData,
   UploadInfoErrors,
   UploadInfoResponses,
-  UploadNarData,
-  UploadNarErrors,
-  UploadNarResponses,
   UploadPathData,
   UploadPathErrors,
   UploadPathResponses,
@@ -970,14 +970,14 @@ export const uploadPath = <ThrowOnError extends boolean = false>(
     }
   });
 
-export const uploadNar = <ThrowOnError extends boolean = false>(
-  options: Options<UploadNarData, ThrowOnError>
-): RequestResult<UploadNarResponses, UploadNarErrors, ThrowOnError> =>
+export const uploadChunk = <ThrowOnError extends boolean = false>(
+  options: Options<UploadChunkData, ThrowOnError>
+): RequestResult<UploadChunkResponses, UploadChunkErrors, ThrowOnError> =>
   (options.client ?? client).post<
-    UploadNarResponses,
-    UploadNarErrors,
+    UploadChunkResponses,
+    UploadChunkErrors,
     ThrowOnError
-  >({ url: '/api/cache/push/{uuid}', ...options });
+  >({ url: '/api/cache/push/{uuid}/{part}', ...options });
 
 export const uploadFinish = <ThrowOnError extends boolean = false>(
   options: Options<UploadFinishData, ThrowOnError>
