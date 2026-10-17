@@ -1,6 +1,12 @@
+use std::time::Duration;
+
 use aide::axum::ApiRouter;
 use aide::axum::routing::get_with;
-use centaurus::{db::init::Connection, error::Result, storage::FileStorage};
+use centaurus::{
+  db::init::Connection,
+  error::Result,
+  storage::{ClientOptions, FileStorage},
+};
 
 use crate::{
   auth::cli_auth::CliAuth,
@@ -22,7 +28,13 @@ pub fn router() -> ApiRouter {
 }
 
 pub async fn state(router: ApiRouter, db: Connection, config: &Config) -> ApiRouter {
-  let storage = FileStorage::init(&config.storage)
+  // NAR streams can outlive the default 30s request timeout (e.g. slow downloads), which
+  // object_store only retries for 3 minutes before cutting the stream. The read timeout
+  // still catches stalled S3 connections as it resets on every read.
+  let client_options = ClientOptions::new()
+    .with_timeout_disabled()
+    .with_read_timeout(Duration::from_secs(60));
+  let storage = FileStorage::init_with_client_options(&config.storage, client_options)
     .await
     .expect("Failed to init FileStorage");
   let push_state = PushState::new(config.max_concurrent_uploads);
