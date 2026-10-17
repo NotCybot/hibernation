@@ -185,7 +185,11 @@ impl<'db> NarTable<'db> {
     Ok(None)
   }
 
-  pub async fn create_upload(&self, nar_id: Uuid, multipart_id: Option<String>) -> Result<(), DbErr> {
+  pub async fn create_upload(
+    &self,
+    nar_id: Uuid,
+    multipart_id: Option<String>,
+  ) -> Result<(), DbErr> {
     nar_upload::ActiveModel {
       id: Set(nar_id),
       multipart_id: Set(multipart_id),
@@ -209,7 +213,9 @@ impl<'db> NarTable<'db> {
   }
 
   pub async fn delete_upload(&self, nar_id: Uuid) -> Result<(), DbErr> {
-    nar_upload::Entity::delete_by_id(nar_id).exec(self.db).await?;
+    nar_upload::Entity::delete_by_id(nar_id)
+      .exec(self.db)
+      .await?;
     Ok(())
   }
 

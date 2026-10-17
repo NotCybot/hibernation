@@ -167,7 +167,10 @@ async fn run_cleanup(db: &Connection, storage: &FileStorage) {
     // Row first: if deleting the file fails afterwards the storage sweep removes it
     match db.nar().delete_orphan_nar(orphan.id).await {
       Ok(true) => {
-        if let Err(e) = storage.delete_file(&format!("{}.nar", orphan.id).into()).await {
+        if let Err(e) = storage
+          .delete_file(&format!("{}.nar", orphan.id).into())
+          .await
+        {
           warn!("Failed to delete orphan nar file {}: {e}", orphan.id);
         }
       }
