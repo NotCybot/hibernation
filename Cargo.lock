@@ -2329,6 +2329,7 @@ dependencies = [
  "sha2 0.11.0",
  "shared",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-error",
  "tracing-indicatif",

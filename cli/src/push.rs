@@ -4,7 +4,7 @@ use std::{
   io::IsTerminal,
   sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
   time::Duration,
 };
@@ -23,10 +23,11 @@ use shared::{
   sig::KeyPair,
 };
 use tokio::{
-  io::AsyncReadExt,
+  io::{AsyncReadExt, BufReader},
   net::unix::{OwnedReadHalf, OwnedWriteHalf},
   time::sleep,
 };
+use tokio_util::io::InspectReader;
 use tracing::{Span, error, info, info_span, instrument, warn};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use uuid::Uuid;
@@ -124,17 +125,20 @@ pub async fn push_paths(
 
   let to_push = path_infos.len();
   info!("Pushing {} paths to the server", to_push);
+  let total_size = path_infos.iter().map(|info| info.nar_size).sum();
   let jobs = Arc::new(tokio::sync::Mutex::new(path_infos));
   let error = Arc::new(AtomicBool::new(false));
+  let done = Arc::new(AtomicUsize::new(0));
   let mut handles = Vec::new();
 
   let tty = std::io::stdin().is_terminal();
   let span = info_span!("header");
   if tty {
-    span.pb_set_length(to_push as u64);
+    span.pb_set_length(total_size);
+    span.pb_set_message(&format!("0/{to_push} paths"));
     span.pb_set_style(
       &ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>2}/{len:2} ({eta})",
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {binary_bytes}/{binary_total_bytes} {msg} ({eta})",
       )
       .unwrap()
       .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
@@ -148,13 +152,25 @@ pub async fn push_paths(
   for _ in 0..(threads).min(to_push) {
     let jobs = jobs.clone();
     let error = error.clone();
+    let done = done.clone();
     let api = api.clone();
     let signing_key = signing_key.clone();
     let cache = res.cache;
     let span = span.clone();
 
     let handle = tokio::spawn(async move {
-      upload_worker(jobs, error, api, cache, force, signing_key, span).await;
+      upload_worker(
+        jobs,
+        error,
+        done,
+        to_push,
+        api,
+        cache,
+        force,
+        signing_key,
+        span,
+      )
+      .await;
     });
     handles.push(handle);
   }
@@ -174,9 +190,12 @@ pub async fn push_paths(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_worker(
   jobs: Arc<tokio::sync::Mutex<Vec<PathInfo>>>,
   error: Arc<AtomicBool>,
+  done: Arc<AtomicUsize>,
+  to_push: usize,
   api: ApiClient,
   cache: Uuid,
   force: bool,
@@ -192,17 +211,33 @@ async fn upload_worker(
     };
     drop(lock);
 
-    if let Err(result) = upload_path(&mut conn, &api, &info, cache, force, &signing_key).await {
+    let mut reported = 0;
+    if let Err(result) = upload_path(
+      &mut conn,
+      &api,
+      &info,
+      cache,
+      force,
+      &signing_key,
+      &span,
+      &mut reported,
+    )
+    .await
+    {
       error!("Failed to upload {}: {:?}", info.store_path, result);
       error.store(true, Ordering::SeqCst);
     } else {
       info!("Successfully uploaded {}", info.store_path);
     }
-    span.pb_inc(1);
+    // Account for the rest of the path, e.g. when it already existed or failed
+    span.pb_inc(info.nar_size.saturating_sub(reported));
+    let done = done.fetch_add(1, Ordering::SeqCst) + 1;
+    span.pb_set_message(&format!("{done}/{to_push} paths"));
   }
 }
 
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 async fn upload_path(
   daemon: &mut DaemonClient<OwnedReadHalf, OwnedWriteHalf>,
   api: &ApiClient,
@@ -210,11 +245,19 @@ async fn upload_path(
   cache: Uuid,
   force: bool,
   signing_key: &KeyPair,
+  header: &Span,
+  reported: &mut u64,
 ) -> Result<()> {
-  let tty = std::io::stdin().is_terminal();
-  if tty {
-    Span::current().pb_set_style(
-      &ProgressStyle::with_template(&format!("↳ Uploading {}", info.store_path)).unwrap(),
+  let span = Span::current();
+  if std::io::stdin().is_terminal() {
+    span.pb_set_length(info.nar_size);
+    span.pb_set_message(&info.store_path.to_string());
+    span.pb_set_style(
+      &ProgressStyle::with_template(
+        "↳ Uploading {msg} [{bar:20.cyan/blue}] {binary_bytes}/{binary_total_bytes}",
+      )
+      .unwrap()
+      .progress_chars("#>-"),
     );
   }
 
@@ -242,6 +285,11 @@ async fn upload_path(
       .nar_from_path(&info.store_path)
       .await
       .context("Failed to get nar")?;
+    // Uncompressed bytes read, compressed sizes are not known upfront
+    let read = AtomicU64::new(0);
+    let nar = BufReader::new(InspectReader::new(nar, |bytes| {
+      read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }));
     let mut encoder = ZstdEncoder::with_quality(nar, Level::Default);
 
     for part in 0.. {
@@ -255,6 +303,11 @@ async fn upload_path(
       file_size += chunk.len() as u64;
       let last = chunk.len() < CHUNK_SIZE;
       upload_chunk(api, upload_id, part, chunk.freeze()).await?;
+
+      let progress = read.load(Ordering::Relaxed).min(info.nar_size) - *reported;
+      span.pb_inc(progress);
+      header.pb_inc(progress);
+      *reported += progress;
       if last {
         break;
       }
