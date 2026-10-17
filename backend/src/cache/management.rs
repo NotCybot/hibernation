@@ -182,10 +182,6 @@ async fn search_store_paths(
   db: Connection,
   Json(req): Json<SearchStorePathsRequest>,
 ) -> Result<Json<Vec<SearchResult>>> {
-  if req.query.trim().is_empty() {
-    bail!(BAD_REQUEST, "Query cannot be empty");
-  }
-
   if db
     .cache()
     .cache_user_access(auth.user_id, path.uuid)
