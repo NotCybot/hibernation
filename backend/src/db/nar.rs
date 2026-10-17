@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use centaurus::error::ErrorReportStatusExt;
 use chrono::Utc;
-use entity::{nar, nar_info, nar_info_reference};
+use entity::{nar, nar_info, nar_info_reference, nar_upload};
 use harmonia_store_core::store_path::StorePath;
 use http::StatusCode;
 use migration::ExprTrait;
@@ -181,6 +183,67 @@ impl<'db> NarTable<'db> {
     nar.insert(self.db).await?;
 
     Ok(None)
+  }
+
+  pub async fn create_upload(&self, nar_id: Uuid, multipart_id: Option<String>) -> Result<(), DbErr> {
+    nar_upload::ActiveModel {
+      id: Set(nar_id),
+      multipart_id: Set(multipart_id),
+      updated_at: Set(Utc::now().naive_utc()),
+    }
+    .insert(self.db)
+    .await?;
+    Ok(())
+  }
+
+  pub async fn touch_upload(&self, nar_id: Uuid) -> Result<(), DbErr> {
+    nar_upload::Entity::update_many()
+      .col_expr(
+        nar_upload::Column::UpdatedAt,
+        Expr::value(Utc::now().naive_utc()),
+      )
+      .filter(nar_upload::Column::Id.eq(nar_id))
+      .exec(self.db)
+      .await?;
+    Ok(())
+  }
+
+  pub async fn delete_upload(&self, nar_id: Uuid) -> Result<(), DbErr> {
+    nar_upload::Entity::delete_by_id(nar_id).exec(self.db).await?;
+    Ok(())
+  }
+
+  /// Uploads without activity for an hour, e.g. abandoned by the client or lost due to a server restart
+  pub async fn stale_uploads(&self) -> Result<Vec<nar_upload::Model>, DbErr> {
+    let cut_off = Utc::now() - chrono::Duration::hours(1);
+
+    nar_upload::Entity::find()
+      .filter(nar_upload::Column::UpdatedAt.lt(cut_off.naive_utc()))
+      .all(self.db)
+      .await
+  }
+
+  /// Ids of all nars and uploads, every file in the storage belongs to one of them
+  pub async fn known_ids(&self) -> Result<HashSet<Uuid>, DbErr> {
+    let mut ids = nar::Entity::find()
+      .select_only()
+      .column(nar::Column::Id)
+      .into_tuple::<Uuid>()
+      .all(self.db)
+      .await?;
+    ids.extend(
+      nar_upload::Entity::find()
+        .select_only()
+        .column(nar_upload::Column::Id)
+        .into_tuple::<Uuid>()
+        .all(self.db)
+        .await?,
+    );
+    Ok(ids.into_iter().collect())
+  }
+
+  pub async fn nar_exists(&self, nar_id: Uuid) -> Result<bool, DbErr> {
+    Ok(nar::Entity::find_by_id(nar_id).count(self.db).await? > 0)
   }
 
   pub async fn orphan_nars(&self) -> Result<Vec<nar::Model>, DbErr> {

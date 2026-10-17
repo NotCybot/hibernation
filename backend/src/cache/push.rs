@@ -108,25 +108,17 @@ pub struct PushState {
 }
 
 impl PushState {
-  pub fn new(max_concurrent_uploads: usize, storage: FileStorage) -> Self {
+  pub fn new(max_concurrent_uploads: usize) -> Self {
     let pending_uploads: Arc<DashMap<Uuid, PendingUpload>> = Arc::new(DashMap::new());
 
+    // Only drops the in-memory state, stored files are tracked in the db and removed by the cleanup job
     tokio::spawn({
       let pending_uploads = pending_uploads.clone();
       async move {
         loop {
           sleep(Duration::from_secs(60)).await;
           let now = Instant::now();
-          let expired = pending_uploads
-            .iter()
-            .filter(|u| now.duration_since(u.touched) >= Duration::from_secs(300))
-            .map(|u| *u.key())
-            .collect::<Vec<_>>();
-          for uuid in expired {
-            if let Some((_, upload)) = pending_uploads.remove(&uuid) {
-              discard(&storage, &upload).await;
-            }
-          }
+          pending_uploads.retain(|_, u| now.duration_since(u.touched) < Duration::from_secs(300));
         }
       }
     });
@@ -142,29 +134,48 @@ fn nar_name(nar_id: Uuid) -> StoragePath {
   format!("{nar_id}.nar").into()
 }
 
-fn part_name(nar_id: Uuid, part: usize) -> StoragePath {
-  format!("{nar_id}.nar.part{part}").into()
+fn parts_dir(nar_id: Uuid) -> StoragePath {
+  format!("parts/{nar_id}").into()
 }
 
-/// Removes everything an unfinished or failed upload left in the storage
-async fn discard(storage: &FileStorage, upload: &PendingUpload) {
-  let name = nar_name(upload.nar_id);
-  if let (Some(id), Some(multipart)) = (&upload.multipart, storage.multipart()) {
-    // Fails if the upload was already completed, the final file is deleted below in that case
-    let _ = multipart.abort_multipart(&name, id).await;
-  } else {
-    for (part, _) in upload.parts.iter().enumerate().filter(|(_, p)| p.is_some()) {
-      if let Err(e) = storage.delete_file(&part_name(upload.nar_id, part)).await {
-        warn!(
-          "Failed to delete upload part {part} of {}: {e:?}",
-          upload.nar_id
-        );
-      }
-    }
+fn part_name(nar_id: Uuid, part: usize) -> StoragePath {
+  format!("parts/{nar_id}/{part}").into()
+}
+
+/// Removes everything an unfinished or failed upload left in the storage, including its db entry.
+/// Keeps the db entry on failure so the cleanup job can retry.
+pub async fn cleanup_upload(
+  storage: &FileStorage,
+  db: &Connection,
+  nar_id: Uuid,
+  multipart: Option<&MultipartId>,
+) -> Result<()> {
+  let name = nar_name(nar_id);
+  if let (Some(id), Some(store)) = (multipart, storage.multipart())
+    && let Err(e) = store.abort_multipart(&name, id).await
+    // Aborting fails if the upload was already completed
+    && !storage.exists(&name).await?
+  {
+    return Err(e).status(StatusCode::INTERNAL_SERVER_ERROR);
   }
-  if let Err(e) = storage.delete_file(&name).await {
-    warn!("Failed to delete upload {}: {e:?}", upload.nar_id);
+
+  let parts = storage
+    .list(Some(&parts_dir(nar_id)))
+    .map_ok(|meta| meta.location)
+    .try_collect::<Vec<_>>()
+    .await
+    .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+  for part in parts {
+    storage.delete_file(&part).await?;
   }
+
+  // Once the nar entry exists the file belongs to it and is removed by the orphan cleanup
+  if !db.nar().nar_exists(nar_id).await? {
+    storage.delete_file(&name).await?;
+  }
+  db.nar().delete_upload(nar_id).await?;
+
+  Ok(())
 }
 
 async fn upload_info(
@@ -341,6 +352,11 @@ async fn upload_path(
     ),
     _ => None,
   };
+  if !nar_found {
+    // a crash between creating the multipart upload and this insert leaks it, add an S3 lifecycle rule
+    // for incomplete multipart uploads if that matters
+    db.nar().create_upload(nar_id, multipart.clone()).await?;
+  }
 
   let upload_id = Uuid::new_v4();
   state.pending_uploads.insert(
@@ -370,6 +386,7 @@ struct UploadChunkPath {
 
 async fn upload_chunk(
   _auth: CliAuth,
+  db: Connection,
   state: PushState,
   storage: FileStorage,
   Path(path): Path<UploadChunkPath>,
@@ -427,6 +444,8 @@ async fn upload_chunk(
   }
   upload.parts[path.part] = Some((part_id, size));
   upload.touched = Instant::now();
+  drop(upload);
+  db.nar().touch_upload(nar_id).await?;
 
   Ok(())
 }
@@ -545,15 +564,22 @@ async fn upload_finish(
   let stored = if upload.nar_found {
     None
   } else {
+    // Keeps the cleanup job away while the file is assembled and verified
+    db.nar().touch_upload(upload.nar_id).await?;
     match store_upload(&storage, &upload, &req).await {
       Ok(stored) => Some(stored),
       Err(e) => {
-        discard(&storage, &upload).await;
+        if let Err(e) =
+          cleanup_upload(&storage, &db, upload.nar_id, upload.multipart.as_ref()).await
+        {
+          warn!("Failed to clean up upload {}: {e:?}", upload.nar_id);
+        }
         return Err(e);
       }
     }
   };
 
+  let uploaded = stored.is_some();
   let info = upload.req;
   let (nar_id, nar_hash, nar_size, file_hash, file_size) = match (
     db.nar()
@@ -561,8 +587,8 @@ async fn upload_finish(
       .await?,
     stored,
   ) {
-    (Some(existing), stored) => {
-      if stored.is_some() {
+    (Some(existing), _) => {
+      if uploaded {
         // Someone else uploaded the same NAR in the meantime
         storage.delete_file(&nar_name(upload.nar_id)).await?;
       }
@@ -585,6 +611,10 @@ async fn upload_finish(
       bail!("NAR no longer exists on the server, retry the upload");
     }
   };
+  if uploaded {
+    // The file is now owned by the nar entry
+    db.nar().delete_upload(upload.nar_id).await?;
+  }
 
   let lock = lock.lock_cache(info.cache).await;
   let Some(cache) = db.cache().by_id(info.cache).await? else {
@@ -800,14 +830,12 @@ mod tests {
 
   #[tokio::test]
   async fn limits_concurrent_uploads() {
-    let (storage, dir) = local_storage().await;
-    let state = PushState::new(3, storage);
+    let state = PushState::new(3);
     let permits = (0..3)
       .map(|_| state.upload_limit.clone().try_acquire_owned().unwrap())
       .collect::<Vec<_>>();
     assert!(state.upload_limit.try_acquire().is_err());
     drop(permits);
     assert!(state.upload_limit.try_acquire().is_ok());
-    let _ = std::fs::remove_dir_all(dir);
   }
 }

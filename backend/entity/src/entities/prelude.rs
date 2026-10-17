@@ -11,6 +11,7 @@ pub use super::key::Entity as Key;
 pub use super::nar::Entity as Nar;
 pub use super::nar_info::Entity as NarInfo;
 pub use super::nar_info_reference::Entity as NarInfoReference;
+pub use super::nar_upload::Entity as NarUpload;
 pub use super::settings::Entity as Settings;
 pub use super::setup::Entity as Setup;
 pub use super::token::Entity as Token;
