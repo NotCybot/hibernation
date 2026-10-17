@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+
 use centaurus::error::ErrorReportStatusExt;
 use chrono::Utc;
-use entity::{nar, nar_info, nar_info_reference};
+use entity::{nar, nar_info, nar_info_reference, nar_upload};
 use harmonia_store_core::store_path::StorePath;
 use http::StatusCode;
 use migration::ExprTrait;
@@ -72,26 +74,20 @@ impl<'db> NarTable<'db> {
     signature: String,
     references: Vec<String>,
   ) -> centaurus::error::Result<()> {
-    // Check if a nar with the same hash and size exists
-    let existing_nar = nar::Entity::find()
-      .filter(nar::Column::NarHash.eq(nar_hash.clone()))
-      .filter(nar::Column::NarSize.eq(nar_size as i64))
-      .one(self.db)
-      .await?;
-
     self
       .db
       .transaction::<_, (), DbErr>(|db| {
         Box::pin(async move {
-          let nar = if let Some(existing_nar) = existing_nar {
-            existing_nar
+          // nar_id is either an existing nar (refreshed by create_nar, which keeps the orphan cleanup away)
+          // or the placeholder of a fresh upload that still needs its data
+          let nar = nar::Entity::find_by_id(nar_id)
+            .one(db)
+            .await?
+            .ok_or(DbErr::RecordNotFound("Nar not found".to_string()))?;
+          let nar = if !nar.nar_hash.is_empty() {
+            nar
           } else {
-            let mut nar = nar::Entity::find_by_id(nar_id)
-              .one(db)
-              .await?
-              .ok_or(DbErr::RecordNotFound("Nar not found".to_string()))?
-              .into_active_model();
-
+            let mut nar = nar.into_active_model();
             nar.hash = Set(file_hash.clone());
             nar.size = Set(file_size as i64);
             nar.nar_hash = Set(nar_hash.clone());
@@ -149,22 +145,31 @@ impl<'db> NarTable<'db> {
     Ok(count > 0)
   }
 
+  pub async fn find_nar(&self, nar_hash: &str, nar_size: u64) -> Result<Option<nar::Model>, DbErr> {
+    nar::Entity::find()
+      .filter(nar::Column::NarHash.eq(nar_hash))
+      .filter(nar::Column::NarSize.eq(nar_size as i64))
+      .one(self.db)
+      .await
+  }
+
   pub async fn create_nar(
     &self,
     nar_id: Uuid,
     nar_hash: &str,
     nar_size: u64,
   ) -> Result<Option<nar::Model>, DbErr> {
-    if let Some(existing) = nar::Entity::find()
+    // Single statement so the orphan cleanup can not delete the nar between finding and refreshing it
+    if let Some(existing) = nar::Entity::update_many()
+      .col_expr(nar::Column::CreatedAt, Expr::value(Utc::now().naive_utc()))
       .filter(nar::Column::NarHash.eq(nar_hash))
       .filter(nar::Column::NarSize.eq(nar_size as i64))
-      .one(self.db)
+      .exec_with_returning(self.db)
       .await?
+      .into_iter()
+      .next()
     {
-      let mut active = existing.into_active_model();
-      active.created_at = Set(Utc::now().naive_utc());
-      let model = active.update(self.db).await?;
-      return Ok(Some(model));
+      return Ok(Some(existing));
     }
 
     let nar = nar::ActiveModel {
@@ -180,8 +185,75 @@ impl<'db> NarTable<'db> {
     Ok(None)
   }
 
+  pub async fn create_upload(
+    &self,
+    nar_id: Uuid,
+    multipart_id: Option<String>,
+  ) -> Result<(), DbErr> {
+    nar_upload::ActiveModel {
+      id: Set(nar_id),
+      multipart_id: Set(multipart_id),
+      updated_at: Set(Utc::now().naive_utc()),
+    }
+    .insert(self.db)
+    .await?;
+    Ok(())
+  }
+
+  pub async fn touch_upload(&self, nar_id: Uuid) -> Result<(), DbErr> {
+    nar_upload::Entity::update_many()
+      .col_expr(
+        nar_upload::Column::UpdatedAt,
+        Expr::value(Utc::now().naive_utc()),
+      )
+      .filter(nar_upload::Column::Id.eq(nar_id))
+      .exec(self.db)
+      .await?;
+    Ok(())
+  }
+
+  pub async fn delete_upload(&self, nar_id: Uuid) -> Result<(), DbErr> {
+    nar_upload::Entity::delete_by_id(nar_id)
+      .exec(self.db)
+      .await?;
+    Ok(())
+  }
+
+  /// Uploads without activity for an hour, e.g. abandoned by the client or lost due to a server restart
+  pub async fn stale_uploads(&self) -> Result<Vec<nar_upload::Model>, DbErr> {
+    let cut_off = Utc::now() - chrono::Duration::hours(1);
+
+    nar_upload::Entity::find()
+      .filter(nar_upload::Column::UpdatedAt.lt(cut_off.naive_utc()))
+      .all(self.db)
+      .await
+  }
+
+  /// Ids of all nars and of all uploads, every file in the storage belongs to one of them
+  pub async fn known_ids(&self) -> Result<(HashSet<Uuid>, HashSet<Uuid>), DbErr> {
+    // Uploads first: a finishing upload creates its nar entry before deleting its upload entry, so a file missing
+    // from this read already has a nar entry the next read sees
+    let uploads = nar_upload::Entity::find()
+      .select_only()
+      .column(nar_upload::Column::Id)
+      .into_tuple::<Uuid>()
+      .all(self.db)
+      .await?;
+    let nars = nar::Entity::find()
+      .select_only()
+      .column(nar::Column::Id)
+      .into_tuple::<Uuid>()
+      .all(self.db)
+      .await?;
+    Ok((nars.into_iter().collect(), uploads.into_iter().collect()))
+  }
+
+  pub async fn nar_exists(&self, nar_id: Uuid) -> Result<bool, DbErr> {
+    Ok(nar::Entity::find_by_id(nar_id).count(self.db).await? > 0)
+  }
+
   pub async fn orphan_nars(&self) -> Result<Vec<nar::Model>, DbErr> {
-    let cut_off = chrono::Utc::now() - chrono::Duration::seconds(600);
+    let cut_off = (chrono::Utc::now() - chrono::Duration::seconds(600)).naive_utc();
 
     nar::Entity::find()
       .left_join(nar_info::Entity)
@@ -191,9 +263,24 @@ impl<'db> NarTable<'db> {
       .await
   }
 
-  pub async fn delete_nar(&self, nar_id: Uuid) -> Result<(), DbErr> {
-    nar::Entity::delete_by_id(nar_id).exec(self.db).await?;
-    Ok(())
+  /// Deletes the nar only if it is still an orphan. Checked in the same statement so a concurrent upload
+  /// reusing the nar (which refreshes created_at first) never loses its data. Returns whether it was deleted.
+  pub async fn delete_orphan_nar(&self, nar_id: Uuid) -> Result<bool, DbErr> {
+    let cut_off = (chrono::Utc::now() - chrono::Duration::seconds(600)).naive_utc();
+    let res = nar::Entity::delete_many()
+      .filter(nar::Column::Id.eq(nar_id))
+      .filter(nar::Column::CreatedAt.lt(cut_off))
+      .filter(
+        nar::Column::Id.not_in_subquery(
+          nar_info::Entity::find()
+            .select_only()
+            .column(nar_info::Column::NarId)
+            .into_query(),
+        ),
+      )
+      .exec(self.db)
+      .await?;
+    Ok(res.rows_affected > 0)
   }
 
   pub async fn find_duplicate_nars(&self) -> Result<Vec<String>, DbErr> {
@@ -214,24 +301,50 @@ impl<'db> NarTable<'db> {
       .await
   }
 
+  /// Only referenced nars, so dedupe never keeps an orphan the cleanup is about to delete
   pub async fn find_nars_by_nar_hash(&self, nar_hash: &str) -> Result<Vec<Uuid>, DbErr> {
     nar::Entity::find()
       .select_only()
       .column(nar::Column::Id)
       .filter(nar::Column::NarHash.eq(nar_hash))
+      .filter(
+        nar::Column::Id.in_subquery(
+          nar_info::Entity::find()
+            .select_only()
+            .column(nar_info::Column::NarId)
+            .into_query(),
+        ),
+      )
       .into_tuple::<Uuid>()
       .all(self.db)
       .await
   }
 
   pub async fn replace_nar_id(&self, old: &[Uuid], new: Uuid) -> Result<(), DbErr> {
-    nar_info::Entity::update_many()
-      .col_expr(nar_info::Column::NarId, Expr::value(new))
-      .filter(nar_info::Column::NarId.is_in(old.to_vec()))
-      .exec(self.db)
-      .await?;
-
-    Ok(())
+    let old = old.to_vec();
+    self
+      .db
+      .transaction::<_, (), DbErr>(|db| {
+        Box::pin(async move {
+          // Refreshing first locks the kept nar, a concurrent orphan cleanup then sees the new created_at and skips
+          // it. If the cleanup deleted it first, moving the references fails on the foreign key and nothing changes
+          nar::Entity::update_many()
+            .col_expr(nar::Column::CreatedAt, Expr::value(Utc::now().naive_utc()))
+            .filter(nar::Column::Id.eq(new))
+            .exec(db)
+            .await?;
+          nar_info::Entity::update_many()
+            .col_expr(nar_info::Column::NarId, Expr::value(new))
+            .filter(nar_info::Column::NarId.is_in(old))
+            .exec(db)
+            .await?;
+          Ok(())
+        })
+      })
+      .await
+      .map_err(|e| match e {
+        sea_orm::TransactionError::Connection(e) | sea_orm::TransactionError::Transaction(e) => e,
+      })
   }
 
   pub async fn missing_paths(

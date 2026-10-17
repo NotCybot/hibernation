@@ -8,18 +8,19 @@ use std::{
 use aide::{OperationIo, axum::ApiRouter};
 use axum::{
   Extension, Json,
-  extract::{DefaultBodyLimit, FromRequestParts, Path, Request},
+  body::to_bytes,
+  extract::{FromRequestParts, Path, Request},
 };
 use centaurus::{
   bail,
   db::init::Connection,
   error::{ErrorReportStatusExt, Result},
   eyre::Context,
-  storage::FileStorage,
+  storage::{FileStorage, MultipartId, PartId, StoragePath},
 };
 use dashmap::DashMap;
 use entity::sea_orm_active_enums::AccessType;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use harmonia_store_core::store_path::StorePath;
 use http::StatusCode;
 use schemars::JsonSchema;
@@ -27,7 +28,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use shared::{
   api::push::{
-    UploadFinishRequest, UploadInfoRequest, UploadInfoResponse, UploadPathRequest,
+    CHUNK_SIZE, UploadFinishRequest, UploadInfoRequest, UploadInfoResponse, UploadPathRequest,
     UploadPathResponse,
   },
   hash::to_nix_base32,
@@ -40,6 +41,7 @@ use tokio::{
   time::sleep,
 };
 use tokio_util::io::{InspectReader, StreamReader};
+use tracing::warn;
 use url::Url;
 use uuid::Uuid;
 
@@ -47,13 +49,16 @@ use crate::{
   auth::cli_auth::CliAuth, cache::state::CacheEvictionState, db::DBTrait, utils::client,
 };
 
+/// S3 allows at most 10000 parts per multipart upload
+const MAX_PARTS: usize = 10000;
+
 pub fn router() -> ApiRouter {
   ApiRouter::new()
     .api_route("/info", post_with(upload_info, |op| op.id("uploadInfo")))
     .api_route("/", post_with(upload_path, |op| op.id("uploadPath")))
     .api_route(
-      "/{uuid}",
-      post_with(upload_nar, |op| op.id("uploadNar")).layer(DefaultBodyLimit::disable()),
+      "/{uuid}/{part}",
+      post_with(upload_chunk, |op| op.id("uploadChunk")),
     )
     .api_route(
       "/{uuid}",
@@ -61,19 +66,15 @@ pub fn router() -> ApiRouter {
     )
 }
 
-struct UploadFinishData {
-  cache: Uuid,
-  store_path: String,
-  store_path_hash: String,
-  nar_hash: String,
-  nar_size: u64,
-  file_hash: String,
-  file_size: u64,
-  deriver: Option<String>,
-  references: Vec<String>,
-  signature: String,
+struct PendingUpload {
+  req: UploadPathRequest,
+  quota: u64,
   nar_id: Uuid,
   nar_found: bool,
+  /// Only set when the storage supports multipart uploads (S3), otherwise parts are stored as separate files
+  multipart: Option<MultipartId>,
+  parts: Vec<Option<(PartId, u64)>>,
+  touched: Instant,
 }
 
 struct NarHasher {
@@ -102,37 +103,81 @@ impl Write for NarHasher {
 #[derive(FromRequestParts, Clone, OperationIo)]
 #[from_request(via(Extension))]
 pub struct PushState {
-  pending_uploads: Arc<DashMap<Uuid, (UploadPathRequest, i64, Instant)>>,
-  pending_finish: Arc<DashMap<Uuid, (UploadFinishData, Instant)>>,
+  pending_uploads: Arc<DashMap<Uuid, PendingUpload>>,
   upload_limit: Arc<Semaphore>,
 }
 
 impl PushState {
   pub fn new(max_concurrent_uploads: usize) -> Self {
-    let pending_uploads = Arc::new(DashMap::new());
-    let pending_finish: Arc<DashMap<Uuid, (UploadFinishData, Instant)>> = Arc::new(DashMap::new());
+    let pending_uploads: Arc<DashMap<Uuid, PendingUpload>> = Arc::new(DashMap::new());
 
+    // Only drops the in-memory state, stored files are tracked in the db and removed by the cleanup job
     tokio::spawn({
       let pending_uploads = pending_uploads.clone();
-      let pending_finish = pending_finish.clone();
       async move {
         loop {
           sleep(Duration::from_secs(60)).await;
           let now = Instant::now();
-          pending_uploads
-            .retain(|_, (_, _, uploaded)| now.duration_since(*uploaded) < Duration::from_secs(300));
-          pending_finish
-            .retain(|_, (_, uploaded)| now.duration_since(*uploaded) < Duration::from_secs(120));
+          pending_uploads.retain(|_, u| now.duration_since(u.touched) < Duration::from_secs(300));
         }
       }
     });
 
     Self {
       pending_uploads,
-      pending_finish,
       upload_limit: Arc::new(Semaphore::new(max_concurrent_uploads)),
     }
   }
+}
+
+fn nar_name(nar_id: Uuid) -> StoragePath {
+  format!("{nar_id}.nar").into()
+}
+
+fn parts_dir(nar_id: Uuid) -> StoragePath {
+  format!("parts/{nar_id}").into()
+}
+
+fn part_name(nar_id: Uuid, part: usize) -> StoragePath {
+  format!("parts/{nar_id}/{part}").into()
+}
+
+/// Removes everything an unfinished or failed upload left in the storage, including its db entry.
+/// Keeps the db entry on failure so the cleanup job can retry.
+pub async fn cleanup_upload(
+  storage: &FileStorage,
+  db: &Connection,
+  nar_id: Uuid,
+  multipart: Option<&MultipartId>,
+) -> Result<()> {
+  let name = nar_name(nar_id);
+  if let (Some(id), Some(store)) = (multipart, storage.multipart())
+    && let Err(e) = store.abort_multipart(&name, id).await
+    // Already aborted by an earlier attempt
+    && !matches!(e, object_store::Error::NotFound { .. })
+    // Aborting fails if the upload was already completed
+    && !storage.exists(&name).await?
+  {
+    return Err(e).status(StatusCode::INTERNAL_SERVER_ERROR);
+  }
+
+  let parts = storage
+    .list(Some(&parts_dir(nar_id)))
+    .map_ok(|meta| meta.location)
+    .try_collect::<Vec<_>>()
+    .await
+    .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+  for part in parts {
+    storage.delete_file(&part).await?;
+  }
+
+  // Once the nar entry exists the file belongs to it and is removed by the orphan cleanup
+  if !db.nar().nar_exists(nar_id).await? {
+    storage.delete_file(&name).await?;
+  }
+  db.nar().delete_upload(nar_id).await?;
+
+  Ok(())
 }
 
 async fn upload_info(
@@ -227,6 +272,7 @@ async fn upload_path(
   auth: CliAuth,
   db: Connection,
   state: PushState,
+  storage: FileStorage,
   Json(req): Json<UploadPathRequest>,
 ) -> Result<Json<UploadPathResponse>> {
   let Ok(store_path) = StorePath::from_base_path(&req.store_path) else {
@@ -293,113 +339,181 @@ async fn upload_path(
     }
   }
 
-  let upload_id = Uuid::new_v4();
-  state
-    .pending_uploads
-    .insert(upload_id, (req, cache.quota, Instant::now()));
+  let nar_id = Uuid::now_v7();
+  let nar_found = db
+    .nar()
+    .find_nar(&req.nar_hash, req.nar_size)
+    .await?
+    .is_some();
+  let multipart = match storage.multipart() {
+    Some(multipart) if !nar_found => Some(
+      multipart
+        .create_multipart(&nar_name(nar_id))
+        .await
+        .status(StatusCode::INTERNAL_SERVER_ERROR)?,
+    ),
+    _ => None,
+  };
+  if !nar_found {
+    // a crash between creating the multipart upload and this insert leaks it, add an S3 lifecycle rule
+    // for incomplete multipart uploads if that matters
+    if let Err(e) = db.nar().create_upload(nar_id, multipart.clone()).await {
+      if let (Some(id), Some(store)) = (&multipart, storage.multipart())
+        && let Err(e) = store.abort_multipart(&nar_name(nar_id), id).await
+      {
+        warn!("Failed to abort multipart upload of {nar_id}: {e}");
+      }
+      return Err(e.into());
+    }
+  }
 
-  Ok(Json(UploadPathResponse { uuid: upload_id }))
+  let upload_id = Uuid::new_v4();
+  state.pending_uploads.insert(
+    upload_id,
+    PendingUpload {
+      req,
+      quota: cache.quota as u64,
+      nar_id,
+      nar_found,
+      multipart,
+      parts: Vec::new(),
+      touched: Instant::now(),
+    },
+  );
+
+  Ok(Json(UploadPathResponse {
+    uuid: upload_id,
+    nar_found,
+  }))
 }
 
 #[derive(Deserialize, Clone, Copy, JsonSchema)]
-struct UploadNarPath {
+struct UploadChunkPath {
   uuid: Uuid,
+  part: usize,
 }
 
-async fn upload_nar(
+async fn upload_chunk(
   _auth: CliAuth,
-  state: PushState,
-  Path(path): Path<UploadNarPath>,
-  storage: FileStorage,
   db: Connection,
+  state: PushState,
+  storage: FileStorage,
+  Path(path): Path<UploadChunkPath>,
   body: Request,
 ) -> Result<()> {
-  let Some((_, (info, quota, _))) = state.pending_uploads.remove(&path.uuid) else {
-    bail!("Invalid upload session");
-  };
+  if path.part >= MAX_PARTS {
+    bail!(BAD_REQUEST, "Too many upload parts");
+  }
   let _permit = state
     .upload_limit
     .acquire()
     .await
     .context("Upload limiter closed")?;
 
-  let nar_id = Uuid::now_v7();
-  let (nar_hash, nar_size, file_hash, file_size, nar_found) = match db
-    .nar()
-    .create_nar(nar_id, &info.nar_hash, info.nar_size)
-    .await?
-  {
-    Some(existing) => {
-      // Just consume the body to avoid client issues, but ignore the content since we already have the NAR
-      let mut stream = body.into_body().into_data_stream();
-      while let Some(_chunk) = stream.next().await {}
+  let chunk = to_bytes(body.into_body(), CHUNK_SIZE)
+    .await
+    .status(StatusCode::PAYLOAD_TOO_LARGE)?;
 
-      (
-        existing.nar_hash,
-        existing.nar_size as u64,
-        existing.hash,
-        existing.size as u64,
-        true,
-      )
-    }
-    None => {
-      let body = StreamReader::new(
-        body
-          .into_body()
-          .into_data_stream()
-          .map_err(io::Error::other),
-      );
-      let (file_hash, file_size) = store_nar(
-        &storage,
-        body,
-        &format!("{}.nar", nar_id),
-        quota as u64,
-        &info.nar_hash,
-        info.nar_size,
-      )
-      .await?;
+  let Some((nar_id, multipart)) = state.pending_uploads.get(&path.uuid).and_then(|upload| {
+    let others = upload
+      .parts
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| *i != path.part)
+      .filter_map(|(_, p)| p.as_ref().map(|(_, size)| *size))
+      .sum::<u64>();
+    (!upload.nar_found && others + chunk.len() as u64 <= upload.quota)
+      .then(|| (upload.nar_id, upload.multipart.clone()))
+  }) else {
+    bail!("Invalid upload session or file size exceeds cache quota");
+  };
 
-      (
-        info.nar_hash.clone(),
-        info.nar_size,
-        file_hash,
-        file_size,
-        false,
-      )
+  let size = chunk.len() as u64;
+  // Re-uploading a part overwrites the previous attempt, which makes retries safe
+  let part_id = match (&multipart, storage.multipart()) {
+    (Some(id), Some(store)) => store
+      .put_part(&nar_name(nar_id), id, path.part, chunk.into())
+      .await
+      .status(StatusCode::INTERNAL_SERVER_ERROR)?,
+    _ => {
+      storage
+        .save_file(&mut &chunk[..], part_name(nar_id, path.part))
+        .await?;
+      PartId {
+        content_id: String::new(),
+      }
     }
   };
 
-  state.pending_finish.insert(
-    path.uuid,
-    (
-      UploadFinishData {
-        cache: info.cache,
-        store_path: info.store_path.to_string(),
-        store_path_hash: StorePath::from_base_path(&info.store_path)
-          .unwrap()
-          .hash()
-          .to_string(),
-        nar_hash,
-        nar_size,
-        file_hash,
-        file_size,
-        signature: info.signature,
-        deriver: info.deriver.map(|d| d.to_string()),
-        references: info.references.into_iter().map(|r| r.to_string()).collect(),
-        nar_id,
-        nar_found,
-      },
-      Instant::now(),
-    ),
-  );
+  let Some(mut upload) = state.pending_uploads.get_mut(&path.uuid) else {
+    bail!("Upload session expired");
+  };
+  if upload.parts.len() <= path.part {
+    upload.parts.resize(path.part + 1, None);
+  }
+  upload.parts[path.part] = Some((part_id, size));
+  upload.touched = Instant::now();
+  drop(upload);
+  db.nar().touch_upload(nar_id).await?;
 
   Ok(())
 }
 
-async fn store_nar<R: AsyncRead + Unpin + Send>(
+/// Assembles the uploaded parts into the final file and validates its content
+async fn store_upload(
   storage: &FileStorage,
+  upload: &PendingUpload,
+  req: &UploadFinishRequest,
+) -> Result<(String, u64)> {
+  let Some(parts) = upload.parts.iter().cloned().collect::<Option<Vec<_>>>() else {
+    bail!("Missing upload parts");
+  };
+  if parts.is_empty() {
+    bail!("Missing upload parts");
+  }
+
+  let name = nar_name(upload.nar_id);
+  if let (Some(id), Some(multipart)) = (&upload.multipart, storage.multipart()) {
+    multipart
+      .complete_multipart(&name, id, parts.into_iter().map(|(p, _)| p).collect())
+      .await
+      .status(StatusCode::INTERNAL_SERVER_ERROR)?;
+  } else {
+    let mut streams = Vec::new();
+    for part in 0..parts.len() {
+      streams.push(
+        storage
+          .get_file(&part_name(upload.nar_id, part), None)
+          .await?
+          .into_data_stream(),
+      );
+    }
+    let mut reader = StreamReader::new(stream::iter(streams).flatten().map_err(io::Error::other));
+    storage.save_file(&mut reader, name.clone()).await?;
+    for part in 0..parts.len() {
+      storage.delete_file(&part_name(upload.nar_id, part)).await?;
+    }
+  }
+
+  let file = storage.get_file(&name, None).await?;
+  let reader = StreamReader::new(file.into_data_stream().map_err(io::Error::other));
+  let (file_hash, file_size) = verify_nar(
+    reader,
+    upload.quota,
+    &upload.req.nar_hash,
+    upload.req.nar_size,
+  )
+  .await?;
+
+  if file_hash != req.file_hash || file_size != req.file_size {
+    bail!("File hash or size mismatch");
+  }
+
+  Ok((file_hash, file_size))
+}
+
+async fn verify_nar<R: AsyncRead + Unpin + Send>(
   body: R,
-  name: &str,
   quota: u64,
   nar_hash: &str,
   nar_size: u64,
@@ -422,22 +536,17 @@ async fn store_nar<R: AsyncRead + Unpin + Send>(
       decode_err = Some(e);
     }
   });
-  storage.save_file(&mut reader, name.into()).await?;
+  io::copy(&mut reader, &mut io::sink()).await?;
   drop(reader);
 
-  let error = if file_size > quota {
-    Some("File size exceeds cache quota".to_string())
+  if file_size > quota {
+    bail!("File size exceeds cache quota");
   } else if let Some(e) = decode_err.or_else(|| nar.flush().err()) {
-    Some(format!("Failed to decompress NAR: {e}"))
-  } else {
-    let decoded = nar.into_inner();
-    (to_nix_base32(&decoded.hasher.finalize()) != nar_hash || decoded.size != nar_size)
-      .then(|| "NAR hash or size mismatch".to_string())
-  };
-
-  if let Some(error) = error {
-    storage.delete_file(&name.into()).await?;
-    bail!("{error}");
+    bail!("Failed to decompress NAR: {e}");
+  }
+  let decoded = nar.into_inner();
+  if to_nix_base32(&decoded.hasher.finalize()) != nar_hash || decoded.size != nar_size {
+    bail!("NAR hash or size mismatch");
   }
 
   Ok((to_nix_base32(&file_hasher.finalize()), file_size))
@@ -447,51 +556,112 @@ async fn upload_finish(
   _auth: CliAuth,
   db: Connection,
   state: PushState,
+  storage: FileStorage,
   lock: CacheEvictionState,
   Path(uuid): Path<Uuid>,
   Json(req): Json<UploadFinishRequest>,
 ) -> Result<()> {
-  let Some((_, (data, _))) = state.pending_finish.remove(&uuid) else {
+  let Some((_, upload)) = state.pending_uploads.remove(&uuid) else {
     bail!("Invalid upload session");
   };
+  let _permit = state
+    .upload_limit
+    .acquire()
+    .await
+    .context("Upload limiter closed")?;
 
-  if !data.nar_found && (data.file_hash != req.file_hash || data.file_size != req.file_size) {
-    bail!("File hash or size mismatch");
+  let stored = if upload.nar_found {
+    None
+  } else {
+    // Keeps the cleanup job away while the file is assembled and verified
+    db.nar().touch_upload(upload.nar_id).await?;
+    match store_upload(&storage, &upload, &req).await {
+      Ok(stored) => Some(stored),
+      Err(e) => {
+        if let Err(e) =
+          cleanup_upload(&storage, &db, upload.nar_id, upload.multipart.as_ref()).await
+        {
+          warn!("Failed to clean up upload {}: {e:?}", upload.nar_id);
+        }
+        return Err(e);
+      }
+    }
+  };
+
+  let uploaded = stored.is_some();
+  let info = upload.req;
+  let (nar_id, nar_hash, nar_size, file_hash, file_size) = match (
+    db.nar()
+      .create_nar(upload.nar_id, &info.nar_hash, info.nar_size)
+      .await?,
+    stored,
+  ) {
+    (Some(existing), _) => {
+      if uploaded {
+        // Someone else uploaded the same NAR in the meantime
+        storage.delete_file(&nar_name(upload.nar_id)).await?;
+      }
+      (
+        existing.id,
+        existing.nar_hash,
+        existing.nar_size as u64,
+        existing.hash,
+        existing.size as u64,
+      )
+    }
+    (None, Some((file_hash, file_size))) => (
+      upload.nar_id,
+      info.nar_hash,
+      info.nar_size,
+      file_hash,
+      file_size,
+    ),
+    (None, None) => {
+      bail!("NAR no longer exists on the server, retry the upload");
+    }
+  };
+  if uploaded {
+    // The file is now owned by the nar entry
+    db.nar().delete_upload(upload.nar_id).await?;
   }
 
-  let lock = lock.lock_cache(data.cache).await;
-  let Some(info) = db.cache().by_id(data.cache).await? else {
+  let lock = lock.lock_cache(info.cache).await;
+  let Some(cache) = db.cache().by_id(info.cache).await? else {
     bail!("Cache not found");
   };
 
-  let Some(size) = db.cache().cache_size(data.cache).await? else {
+  let Some(size) = db.cache().cache_size(info.cache).await? else {
     bail!("Cache not found");
   };
 
-  if info.quota < data.file_size as i64 {
+  if cache.quota < file_size as i64 {
     bail!("File size exceeds cache quota");
   }
 
-  let diff = (size + data.file_size as i64) - info.quota;
+  let diff = (size + file_size as i64) - cache.quota;
   if diff > 0 {
     db.cache()
-      .evict(data.cache, diff, info.eviction_policy)
+      .evict(info.cache, diff, cache.eviction_policy)
       .await?;
   }
 
+  let store_path_hash = StorePath::from_base_path(&info.store_path)
+    .unwrap()
+    .hash()
+    .to_string();
   db.nar()
     .create_path(
-      data.nar_id,
-      data.cache,
-      data.store_path,
-      data.store_path_hash,
-      data.nar_hash,
-      data.nar_size,
-      data.file_hash,
-      data.file_size,
-      data.deriver,
-      data.signature,
-      data.references,
+      nar_id,
+      info.cache,
+      info.store_path,
+      store_path_hash,
+      nar_hash,
+      nar_size,
+      file_hash,
+      file_size,
+      info.deriver,
+      info.signature,
+      info.references,
     )
     .await?;
 
@@ -504,31 +674,6 @@ async fn upload_finish(
 mod tests {
   use super::*;
 
-  struct TestStorage {
-    storage: FileStorage,
-    dir: std::path::PathBuf,
-  }
-
-  impl TestStorage {
-    async fn new() -> Self {
-      let dir = std::env::temp_dir().join(format!("hibernation-push-{}", Uuid::new_v4()));
-      let config = centaurus::storage::StorageConfig {
-        storage_path: dir.to_string_lossy().into_owned(),
-        ..Default::default()
-      };
-      Self {
-        storage: FileStorage::init(&config).await.unwrap(),
-        dir,
-      }
-    }
-  }
-
-  impl Drop for TestStorage {
-    fn drop(&mut self) {
-      let _ = std::fs::remove_dir_all(&self.dir);
-    }
-  }
-
   fn nar() -> Vec<u8> {
     (0..200_000u32)
       .flat_map(|i| (i % 251).to_le_bytes())
@@ -540,32 +685,20 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn stores_valid_nar() {
-    let s = TestStorage::new().await;
+  async fn verifies_valid_nar() {
     let nar = nar();
     let file = zstd::encode_all(&nar[..], 3).unwrap();
 
-    let (file_hash, file_size) = store_nar(
-      &s.storage,
-      &file[..],
-      "a.nar",
-      u64::MAX,
-      &hash(&nar),
-      nar.len() as u64,
-    )
-    .await
-    .unwrap();
+    let (file_hash, file_size) = verify_nar(&file[..], u64::MAX, &hash(&nar), nar.len() as u64)
+      .await
+      .unwrap();
 
     assert_eq!(file_hash, hash(&file));
     assert_eq!(file_size, file.len() as u64);
-    assert_eq!(std::fs::read(s.dir.join("a.nar")).unwrap(), file);
   }
 
   async fn assert_rejected(file: &[u8], quota: u64, nar_hash: &str, nar_size: u64) {
-    let s = TestStorage::new().await;
-    let res = store_nar(&s.storage, file, "a.nar", quota, nar_hash, nar_size).await;
-    assert!(res.is_err());
-    assert!(!s.storage.exists(&"a.nar".into()).await.unwrap());
+    assert!(verify_nar(file, quota, nar_hash, nar_size).await.is_err());
   }
 
   #[tokio::test]
@@ -577,18 +710,9 @@ mod tests {
 
   #[tokio::test]
   async fn accepts_exactly_quota() {
-    let s = TestStorage::new().await;
     let nar = nar();
     let file = zstd::encode_all(&nar[..], 3).unwrap();
-    let res = store_nar(
-      &s.storage,
-      &file[..],
-      "a.nar",
-      file.len() as u64,
-      &hash(&nar),
-      nar.len() as u64,
-    )
-    .await;
+    let res = verify_nar(&file[..], file.len() as u64, &hash(&nar), nar.len() as u64).await;
     assert!(res.is_ok());
   }
 
@@ -630,6 +754,87 @@ mod tests {
     let nar = nar();
     let file = zstd::encode_all(&nar[..], 3).unwrap();
     assert_rejected(&file, u64::MAX, &hash(&nar), nar.len() as u64 + 1).await;
+  }
+
+  async fn local_storage() -> (FileStorage, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("hibernation-push-{}", Uuid::new_v4()));
+    let config = centaurus::storage::StorageConfig {
+      storage_path: dir.to_string_lossy().into_owned(),
+      ..Default::default()
+    };
+    (FileStorage::init(&config).await.unwrap(), dir)
+  }
+
+  fn pending(nar: &[u8], parts: usize) -> PendingUpload {
+    PendingUpload {
+      req: UploadPathRequest {
+        cache: Uuid::new_v4(),
+        force: false,
+        store_path: String::new(),
+        nar_hash: hash(nar),
+        nar_size: nar.len() as u64,
+        deriver: None,
+        references: Vec::new(),
+        signature: String::new(),
+      },
+      quota: u64::MAX,
+      nar_id: Uuid::new_v4(),
+      nar_found: false,
+      multipart: None,
+      parts: vec![
+        Some((
+          PartId {
+            content_id: String::new()
+          },
+          0
+        ));
+        parts
+      ],
+      touched: Instant::now(),
+    }
+  }
+
+  #[tokio::test]
+  async fn assembles_local_parts() {
+    let (storage, dir) = local_storage().await;
+    let nar = nar();
+    let file = zstd::encode_all(&nar[..], 3).unwrap();
+    let chunks = file.chunks(file.len() / 3 + 1).collect::<Vec<_>>();
+    let upload = pending(&nar, chunks.len());
+    // Upload out of order like retried chunks could
+    for (i, chunk) in chunks.iter().enumerate().rev() {
+      storage
+        .save_file(&mut &chunk[..], part_name(upload.nar_id, i))
+        .await
+        .unwrap();
+    }
+
+    let req = UploadFinishRequest {
+      file_hash: hash(&file),
+      file_size: file.len() as u64,
+    };
+    store_upload(&storage, &upload, &req).await.unwrap();
+
+    assert_eq!(
+      std::fs::read(dir.join(format!("{}.nar", upload.nar_id))).unwrap(),
+      file
+    );
+    assert!(!storage.exists(&part_name(upload.nar_id, 0)).await.unwrap());
+    let _ = std::fs::remove_dir_all(dir);
+  }
+
+  #[tokio::test]
+  async fn rejects_missing_part() {
+    let (storage, dir) = local_storage().await;
+    let nar = nar();
+    let mut upload = pending(&nar, 2);
+    upload.parts[0] = None;
+    let req = UploadFinishRequest {
+      file_hash: String::new(),
+      file_size: 0,
+    };
+    assert!(store_upload(&storage, &upload, &req).await.is_err());
+    let _ = std::fs::remove_dir_all(dir);
   }
 
   #[tokio::test]

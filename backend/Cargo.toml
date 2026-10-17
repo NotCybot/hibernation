@@ -37,6 +37,7 @@ image = { version = "0.25.10", default-features = false, features = [
   "webp"
 ] }
 migration = { path = "migration" }
+object_store = { version = "0.14.2", default-features = false }
 rand = "0.10.2"
 regex = "1.13.1"
 reqwest = { version = "0.13.4", features = ["form", "http3", "json"] }

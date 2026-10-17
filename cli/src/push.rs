@@ -3,12 +3,14 @@ use std::{
   fmt::Write,
   io::IsTerminal,
   sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
+  time::Duration,
 };
 
 use async_compression::{Level, tokio::bufread::ZstdEncoder};
+use bytes::{Bytes, BytesMut};
 use centaurus::{error::Result, eyre::Context};
 use harmonia_protocol::NarHash;
 use harmonia_store_core::store_path::{StoreDir, StorePath};
@@ -16,17 +18,23 @@ use harmonia_store_remote::{DaemonClient, DaemonStore};
 use indicatif::{ProgressState, ProgressStyle};
 use sha2::{Digest, Sha256};
 use shared::{
-  api::push::{UploadFinishRequest, UploadPathRequest},
+  api::push::{CHUNK_SIZE, UploadFinishRequest, UploadPathRequest},
   hash::to_nix_base32,
   sig::KeyPair,
 };
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio_util::io::{InspectReader, ReaderStream};
+use tokio::{
+  io::{AsyncReadExt, BufReader},
+  net::unix::{OwnedReadHalf, OwnedWriteHalf},
+  time::sleep,
+};
+use tokio_util::io::InspectReader;
 use tracing::{Span, error, info, info_span, instrument, warn};
 use tracing_indicatif::span_ext::IndicatifSpanExt;
 use uuid::Uuid;
 
 use crate::api::{ApiClient, PushInfoResult};
+
+const CHUNK_RETRIES: u32 = 3;
 
 #[derive(Debug, Clone)]
 struct PathInfo {
@@ -117,17 +125,20 @@ pub async fn push_paths(
 
   let to_push = path_infos.len();
   info!("Pushing {} paths to the server", to_push);
+  let total_size = path_infos.iter().map(|info| info.nar_size).sum();
   let jobs = Arc::new(tokio::sync::Mutex::new(path_infos));
   let error = Arc::new(AtomicBool::new(false));
+  let done = Arc::new(AtomicUsize::new(0));
   let mut handles = Vec::new();
 
   let tty = std::io::stdin().is_terminal();
   let span = info_span!("header");
   if tty {
-    span.pb_set_length(to_push as u64);
+    span.pb_set_length(total_size);
+    span.pb_set_message(&format!("0/{to_push} paths"));
     span.pb_set_style(
       &ProgressStyle::with_template(
-        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos:>2}/{len:2} ({eta})",
+        "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {binary_bytes}/{binary_total_bytes} {msg} ({eta})",
       )
       .unwrap()
       .with_key("eta", |state: &ProgressState, w: &mut dyn Write| {
@@ -141,13 +152,25 @@ pub async fn push_paths(
   for _ in 0..(threads).min(to_push) {
     let jobs = jobs.clone();
     let error = error.clone();
+    let done = done.clone();
     let api = api.clone();
     let signing_key = signing_key.clone();
     let cache = res.cache;
     let span = span.clone();
 
     let handle = tokio::spawn(async move {
-      upload_worker(jobs, error, api, cache, force, signing_key, span).await;
+      upload_worker(
+        jobs,
+        error,
+        done,
+        to_push,
+        api,
+        cache,
+        force,
+        signing_key,
+        span,
+      )
+      .await;
     });
     handles.push(handle);
   }
@@ -167,9 +190,12 @@ pub async fn push_paths(
   }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_worker(
   jobs: Arc<tokio::sync::Mutex<Vec<PathInfo>>>,
   error: Arc<AtomicBool>,
+  done: Arc<AtomicUsize>,
+  to_push: usize,
   api: ApiClient,
   cache: Uuid,
   force: bool,
@@ -185,17 +211,33 @@ async fn upload_worker(
     };
     drop(lock);
 
-    if let Err(result) = upload_path(&mut conn, &api, &info, cache, force, &signing_key).await {
+    let mut reported = 0;
+    if let Err(result) = upload_path(
+      &mut conn,
+      &api,
+      &info,
+      cache,
+      force,
+      &signing_key,
+      &span,
+      &mut reported,
+    )
+    .await
+    {
       error!("Failed to upload {}: {:?}", info.store_path, result);
       error.store(true, Ordering::SeqCst);
     } else {
       info!("Successfully uploaded {}", info.store_path);
     }
-    span.pb_inc(1);
+    // Account for the rest of the path, e.g. when it already existed or failed
+    span.pb_inc(info.nar_size.saturating_sub(reported));
+    let done = done.fetch_add(1, Ordering::SeqCst) + 1;
+    span.pb_set_message(&format!("{done}/{to_push} paths"));
   }
 }
 
 #[instrument(skip_all)]
+#[allow(clippy::too_many_arguments)]
 async fn upload_path(
   daemon: &mut DaemonClient<OwnedReadHalf, OwnedWriteHalf>,
   api: &ApiClient,
@@ -203,18 +245,26 @@ async fn upload_path(
   cache: Uuid,
   force: bool,
   signing_key: &KeyPair,
+  header: &Span,
+  reported: &mut u64,
 ) -> Result<()> {
-  let tty = std::io::stdin().is_terminal();
-  if tty {
-    Span::current().pb_set_style(
-      &ProgressStyle::with_template(&format!("↳ Uploading {}", info.store_path)).unwrap(),
+  let span = Span::current();
+  if std::io::stdin().is_terminal() {
+    span.pb_set_length(info.nar_size);
+    span.pb_set_message(&info.store_path.to_string());
+    span.pb_set_style(
+      &ProgressStyle::with_template(
+        "↳ Uploading {msg} [{bar:20.cyan/blue}] {binary_bytes}/{binary_total_bytes}",
+      )
+      .unwrap()
+      .progress_chars("#>-"),
     );
   }
 
   let nar_hash = to_nix_base32(info.nar_hash.as_ref());
   let signature = signing_key.sign(&info.store_path, &nar_hash, info.nar_size, &info.references);
 
-  let upload_id = api
+  let upload = api
     .upload_path(&UploadPathRequest {
       cache,
       force,
@@ -225,34 +275,45 @@ async fn upload_path(
       references: info.references.iter().map(|r| r.to_string()).collect(),
       signature,
     })
-    .await?
-    .uuid;
+    .await?;
+  let upload_id = upload.uuid;
 
-  let nar = daemon
-    .nar_from_path(&info.store_path)
-    .await
-    .context("Failed to get nar")?;
-  let encoder = ZstdEncoder::with_quality(nar, Level::Default);
+  let mut hasher = Sha256::new();
+  let mut file_size = 0;
+  if !upload.nar_found {
+    let nar = daemon
+      .nar_from_path(&info.store_path)
+      .await
+      .context("Failed to get nar")?;
+    // Uncompressed bytes read, compressed sizes are not known upfront
+    let read = AtomicU64::new(0);
+    let nar = BufReader::new(InspectReader::new(nar, |bytes| {
+      read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }));
+    let mut encoder = ZstdEncoder::with_quality(nar, Level::Default);
 
-  let state = Arc::new(Mutex::new((Sha256::new(), 0)));
-  let state_clone = state.clone();
-  let encoder = InspectReader::new(encoder, move |bytes| {
-    // This constant blocking seems bad and in debug mode it is. But in release mode the performance difference
-    // is about 13% and the non blocking version lost some of the data and was not really stable.
-    let mut state = state.lock().unwrap();
-    state.0.update(bytes);
-    state.1 += bytes.len() as u64;
-  });
+    for part in 0.. {
+      let mut chunk = BytesMut::with_capacity(CHUNK_SIZE);
+      while chunk.len() < CHUNK_SIZE && encoder.read_buf(&mut chunk).await? > 0 {}
+      // Always send at least one (possibly empty) part
+      if chunk.is_empty() && part > 0 {
+        break;
+      }
+      hasher.update(&chunk);
+      file_size += chunk.len() as u64;
+      let last = chunk.len() < CHUNK_SIZE;
+      upload_chunk(api, upload_id, part, chunk.freeze()).await?;
 
-  api
-    .upload_nar(upload_id, ReaderStream::new(encoder))
-    .await
-    .context("Failed to upload nar")?;
-
-  let (file_hash, file_size) = {
-    let state = state_clone.lock().unwrap();
-    (to_nix_base32(&state.0.clone().finalize()), state.1)
-  };
+      let progress = read.load(Ordering::Relaxed).min(info.nar_size) - *reported;
+      span.pb_inc(progress);
+      header.pb_inc(progress);
+      *reported += progress;
+      if last {
+        break;
+      }
+    }
+  }
+  let file_hash = to_nix_base32(&hasher.finalize());
 
   api
     .upload_finish(
@@ -265,4 +326,20 @@ async fn upload_path(
     .await?;
 
   Ok(())
+}
+
+async fn upload_chunk(api: &ApiClient, upload_id: Uuid, part: u32, chunk: Bytes) -> Result<()> {
+  let mut attempt = 0;
+  loop {
+    match api.upload_chunk(upload_id, part, chunk.clone()).await {
+      Ok(()) => return Ok(()),
+      Err(e) if attempt < CHUNK_RETRIES => {
+        let delay = Duration::from_secs(1 << attempt);
+        warn!("Failed to upload chunk {part}, retrying in {delay:?}: {e:#}");
+        sleep(delay).await;
+        attempt += 1;
+      }
+      Err(e) => return Err(e),
+    }
+  }
 }

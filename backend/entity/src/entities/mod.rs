@@ -13,6 +13,7 @@ pub mod key;
 pub mod nar;
 pub mod nar_info;
 pub mod nar_info_reference;
+pub mod nar_upload;
 pub mod sea_orm_active_enums;
 pub mod settings;
 pub mod setup;
