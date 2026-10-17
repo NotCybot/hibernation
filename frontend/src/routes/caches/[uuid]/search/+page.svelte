@@ -31,7 +31,7 @@
 
   $effect(() => {
     let _ = searchTrigger;
-    if (!input || !cacheInfo) return;
+    if (!cacheInfo) return;
     searchStorePaths({
       path: { uuid: cacheInfo.uuid },
       body: {
