@@ -15,7 +15,7 @@ use centaurus::{error::Result, eyre::Context};
 use harmonia_protocol::NarHash;
 use harmonia_store_core::store_path::{StoreDir, StorePath};
 use harmonia_store_remote::{DaemonClient, DaemonStore};
-use indicatif::{ProgressState, ProgressStyle};
+use indicatif::{BinaryBytes, ProgressState, ProgressStyle};
 use sha2::{Digest, Sha256};
 use shared::{
   api::push::{CHUNK_SIZE, UploadFinishRequest, UploadPathRequest},
@@ -25,7 +25,7 @@ use shared::{
 use tokio::{
   io::{AsyncReadExt, BufReader},
   net::unix::{OwnedReadHalf, OwnedWriteHalf},
-  time::sleep,
+  time::{interval, sleep},
 };
 use tokio_util::io::InspectReader;
 use tracing::{Span, error, info, info_span, instrument, warn};
@@ -35,6 +35,22 @@ use uuid::Uuid;
 use crate::api::{ApiClient, PushInfoResult};
 
 const CHUNK_RETRIES: u32 = 3;
+const PROGRESS_TICK: Duration = Duration::from_millis(100);
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Overall push progress, rendered by the header bar on a tty and logged otherwise
+struct Progress {
+  header: Span,
+  uploaded: AtomicU64,
+  done: AtomicUsize,
+}
+
+impl Progress {
+  fn inc(&self, bytes: u64) {
+    self.header.pb_inc(bytes);
+    self.uploaded.fetch_add(bytes, Ordering::Relaxed);
+  }
+}
 
 #[derive(Debug, Clone)]
 struct PathInfo {
@@ -128,7 +144,6 @@ pub async fn push_paths(
   let total_size = path_infos.iter().map(|info| info.nar_size).sum();
   let jobs = Arc::new(tokio::sync::Mutex::new(path_infos));
   let error = Arc::new(AtomicBool::new(false));
-  let done = Arc::new(AtomicUsize::new(0));
   let mut handles = Vec::new();
 
   let tty = std::io::stdin().is_terminal();
@@ -148,27 +163,48 @@ pub async fn push_paths(
     );
   }
   let enter = span.enter();
+  let progress = Arc::new(Progress {
+    header: span.clone(),
+    uploaded: AtomicU64::new(0),
+    done: AtomicUsize::new(0),
+  });
+
+  let logger = (!tty).then(|| {
+    let progress = progress.clone();
+    tokio::spawn(async move {
+      let mut tick = interval(PROGRESS_LOG_INTERVAL);
+      loop {
+        tick.tick().await;
+        let uploaded = progress.uploaded.load(Ordering::Relaxed);
+        let percent = uploaded as f64 * 100.0 / total_size.max(1) as f64;
+        info!(
+          "Progress: {}/{} ({percent:.1}%), {}/{to_push} paths",
+          BinaryBytes(uploaded),
+          BinaryBytes(total_size),
+          progress.done.load(Ordering::Relaxed),
+        );
+      }
+    })
+  });
 
   for _ in 0..(threads).min(to_push) {
     let jobs = jobs.clone();
     let error = error.clone();
-    let done = done.clone();
+    let progress = progress.clone();
     let api = api.clone();
     let signing_key = signing_key.clone();
     let cache = res.cache;
-    let span = span.clone();
 
     let handle = tokio::spawn(async move {
       upload_worker(
         jobs,
         error,
-        done,
         to_push,
         api,
         cache,
         force,
         signing_key,
-        span,
+        progress,
       )
       .await;
     });
@@ -177,6 +213,9 @@ pub async fn push_paths(
 
   for handle in handles {
     handle.await.unwrap();
+  }
+  if let Some(logger) = logger {
+    logger.abort();
   }
 
   std::mem::drop(enter);
@@ -194,13 +233,12 @@ pub async fn push_paths(
 async fn upload_worker(
   jobs: Arc<tokio::sync::Mutex<Vec<PathInfo>>>,
   error: Arc<AtomicBool>,
-  done: Arc<AtomicUsize>,
   to_push: usize,
   api: ApiClient,
   cache: Uuid,
   force: bool,
   signing_key: KeyPair,
-  span: Span,
+  progress: Arc<Progress>,
 ) {
   let mut conn = DaemonClient::builder().connect_daemon().await.unwrap();
 
@@ -219,7 +257,7 @@ async fn upload_worker(
       cache,
       force,
       &signing_key,
-      &span,
+      &progress,
       &mut reported,
     )
     .await
@@ -230,9 +268,11 @@ async fn upload_worker(
       info!("Successfully uploaded {}", info.store_path);
     }
     // Account for the rest of the path, e.g. when it already existed or failed
-    span.pb_inc(info.nar_size.saturating_sub(reported));
-    let done = done.fetch_add(1, Ordering::SeqCst) + 1;
-    span.pb_set_message(&format!("{done}/{to_push} paths"));
+    progress.inc(info.nar_size.saturating_sub(reported));
+    let done = progress.done.fetch_add(1, Ordering::SeqCst) + 1;
+    progress
+      .header
+      .pb_set_message(&format!("{done}/{to_push} paths"));
   }
 }
 
@@ -245,7 +285,7 @@ async fn upload_path(
   cache: Uuid,
   force: bool,
   signing_key: &KeyPair,
-  header: &Span,
+  progress: &Progress,
   reported: &mut u64,
 ) -> Result<()> {
   let span = Span::current();
@@ -302,12 +342,33 @@ async fn upload_path(
       hasher.update(&chunk);
       file_size += chunk.len() as u64;
       let last = chunk.len() < CHUNK_SIZE;
-      upload_chunk(api, upload_id, part, chunk.freeze()).await?;
 
-      let progress = read.load(Ordering::Relaxed).min(info.nar_size) - *reported;
-      span.pb_inc(progress);
-      header.pb_inc(progress);
-      *reported += progress;
+      // Attribute the uncompressed bytes of this chunk proportionally to the compressed bytes sent
+      let chunk_len = chunk.len().max(1) as u64;
+      let start = *reported;
+      let chunk_read = read.load(Ordering::Relaxed).min(info.nar_size) - start;
+      let mut advance = |to: u64| {
+        let delta = to.saturating_sub(*reported);
+        span.pb_inc(delta);
+        progress.inc(delta);
+        *reported += delta;
+      };
+
+      let sent = Arc::new(AtomicU64::new(0));
+      let upload = upload_chunk(api, upload_id, part, chunk.freeze(), &sent);
+      tokio::pin!(upload);
+      let mut tick = interval(PROGRESS_TICK);
+      loop {
+        tokio::select! {
+          res = &mut upload => break res?,
+          _ = tick.tick() => {
+            let sent = sent.load(Ordering::Relaxed).min(chunk_len);
+            advance(start + chunk_read * sent / chunk_len);
+          }
+        }
+      }
+      advance(start + chunk_read);
+
       if last {
         break;
       }
@@ -328,10 +389,20 @@ async fn upload_path(
   Ok(())
 }
 
-async fn upload_chunk(api: &ApiClient, upload_id: Uuid, part: u32, chunk: Bytes) -> Result<()> {
+async fn upload_chunk(
+  api: &ApiClient,
+  upload_id: Uuid,
+  part: u32,
+  chunk: Bytes,
+  sent: &Arc<AtomicU64>,
+) -> Result<()> {
   let mut attempt = 0;
   loop {
-    match api.upload_chunk(upload_id, part, chunk.clone()).await {
+    sent.store(0, Ordering::Relaxed);
+    match api
+      .upload_chunk(upload_id, part, chunk.clone(), sent.clone())
+      .await
+    {
       Ok(()) => return Ok(()),
       Err(e) if attempt < CHUNK_RETRIES => {
         let delay = Duration::from_secs(1 << attempt);
