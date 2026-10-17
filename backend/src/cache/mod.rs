@@ -27,7 +27,8 @@ pub async fn state(router: ApiRouter, db: Connection, config: &Config) -> ApiRou
     .expect("Failed to init FileStorage");
   let push_state = PushState::new(config.max_concurrent_uploads);
 
-  cleanup::start(db.clone(), storage.clone());
+  let local_path = (!config.storage.use_s3()).then(|| config.storage.storage_path.clone().into());
+  cleanup::start(db.clone(), storage.clone(), local_path);
   dedupe::start(db);
 
   router

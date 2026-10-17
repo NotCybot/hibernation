@@ -153,6 +153,8 @@ pub async fn cleanup_upload(
   let name = nar_name(nar_id);
   if let (Some(id), Some(store)) = (multipart, storage.multipart())
     && let Err(e) = store.abort_multipart(&name, id).await
+    // Already aborted by an earlier attempt
+    && !matches!(e, object_store::Error::NotFound { .. })
     // Aborting fails if the upload was already completed
     && !storage.exists(&name).await?
   {
@@ -355,7 +357,14 @@ async fn upload_path(
   if !nar_found {
     // a crash between creating the multipart upload and this insert leaks it, add an S3 lifecycle rule
     // for incomplete multipart uploads if that matters
-    db.nar().create_upload(nar_id, multipart.clone()).await?;
+    if let Err(e) = db.nar().create_upload(nar_id, multipart.clone()).await {
+      if let (Some(id), Some(store)) = (&multipart, storage.multipart())
+        && let Err(e) = store.abort_multipart(&nar_name(nar_id), id).await
+      {
+        warn!("Failed to abort multipart upload of {nar_id}: {e}");
+      }
+      return Err(e.into());
+    }
   }
 
   let upload_id = Uuid::new_v4();

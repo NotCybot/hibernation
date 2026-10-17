@@ -562,6 +562,7 @@ dependencies = [
  "http",
  "image",
  "migration",
+ "object_store",
  "rand 0.10.3",
  "regex",
  "reqwest",
