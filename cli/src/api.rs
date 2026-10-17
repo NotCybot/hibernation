@@ -1,12 +1,20 @@
-use std::{io::IsTerminal, path::PathBuf};
+use std::{
+  io::{Cursor, IsTerminal},
+  path::PathBuf,
+  sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+  },
+};
 
 use bytes::Bytes;
 use centaurus::{VERSION_HEADER_NAME, error::Result, eyre::Context};
-use reqwest::{Client, Method, RequestBuilder, Response};
+use reqwest::{Body, Client, Method, RequestBuilder, Response, header::CONTENT_LENGTH};
 use serde::Deserialize;
 use shared::api::push::{
   UploadFinishRequest, UploadInfoResponse, UploadPathRequest, UploadPathResponse,
 };
+use tokio_util::io::{InspectReader, ReaderStream};
 use tracing::{error, warn};
 use url::Url;
 use uuid::Uuid;
@@ -166,10 +174,25 @@ impl ApiClient {
     Ok(res)
   }
 
-  pub async fn upload_chunk(&self, upload_id: Uuid, part: u32, chunk: Bytes) -> Result<()> {
+  /// Uploads a chunk, adding the number of body bytes handed to the connection to `sent`
+  pub async fn upload_chunk(
+    &self,
+    upload_id: Uuid,
+    part: u32,
+    chunk: Bytes,
+    sent: Arc<AtomicU64>,
+  ) -> Result<()> {
+    let len = chunk.len();
+    let reader = InspectReader::new(Cursor::new(chunk), move |bytes| {
+      sent.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    });
     self
       .req(&format!("/api/cache/push/{upload_id}/{part}"), Method::POST)?
-      .body(chunk)
+      .header(CONTENT_LENGTH, len)
+      .body(Body::wrap_stream(ReaderStream::with_capacity(
+        reader,
+        64 * 1024,
+      )))
       .send()
       .await?
       .error_for_status()?;
