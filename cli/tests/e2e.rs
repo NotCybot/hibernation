@@ -19,6 +19,14 @@ use reqwest::{Client, StatusCode};
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs1::DecodeRsaPublicKey, rand_core::OsRng};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use testcontainers_modules::{
+  postgres::Postgres,
+  testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner,
+  },
+};
 use uuid::Uuid;
 
 /// Same key as `secret.key` / `public.key` in the repo root.
@@ -44,6 +52,43 @@ struct Server {
   cookie: String,
   token: String,
   _dir: TempDir,
+  _containers: Option<(ContainerAsync<Postgres>, ContainerAsync<GenericImage>)>,
+}
+
+/// Postgres + S3Mock containers like `backend/tests/common.rs`, started concurrently. Sets the backend's env vars.
+async fn start_pg_s3() -> (ContainerAsync<Postgres>, ContainerAsync<GenericImage>) {
+  let (pg, s3) = tokio::join!(
+    Postgres::default().with_tag("18-alpine").start(),
+    GenericImage::new("adobe/s3mock", "5.2.3")
+      .with_exposed_port(ContainerPort::Tcp(9090))
+      .with_wait_for(WaitFor::message_on_stdout("Started S3MockApplication"))
+      .with_env_var(
+        "COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS",
+        "hibernation"
+      )
+      .start(),
+  );
+  let (pg, s3) = (pg.expect("start postgres"), s3.expect("start S3Mock"));
+  let db_url = format!(
+    "postgres://postgres:postgres@{}:{}/postgres",
+    pg.get_host().await.unwrap(),
+    pg.get_host_port_ipv4(5432).await.unwrap()
+  );
+  let s3_host = format!(
+    "http://{}:{}",
+    s3.get_host().await.unwrap(),
+    s3.get_host_port_ipv4(9090).await.unwrap()
+  );
+  unsafe {
+    std::env::set_var("DB_URL", db_url);
+    std::env::set_var("S3_BUCKET", "hibernation");
+    std::env::set_var("S3_REGION", "us-east-1");
+    std::env::set_var("S3_HOST", s3_host);
+    std::env::set_var("S3_ACCESS_KEY", "test");
+    std::env::set_var("S3_SECRET_KEY", "test");
+    std::env::set_var("S3_FORCE_PATH_STYLE", "true");
+  }
+  (pg, s3)
 }
 
 impl Server {
@@ -62,8 +107,9 @@ impl Server {
       .unwrap()
   }
 
-  /// Boot the backend, complete setup, create the public cache `main` (no downstream caches) and a CLI token
-  async fn start() -> Server {
+  /// Boot the backend (sqlite + local fs, or Postgres + S3 containers), complete setup, create the public cache
+  /// `main` (no downstream caches) and a CLI token
+  async fn start(pg_s3: bool) -> Server {
     let dir = TempDir::new().unwrap();
     unsafe {
       std::env::set_var("PORT", "0");
@@ -75,6 +121,11 @@ impl Server {
       std::env::set_var("STORAGE_PATH", dir.path().join("storage"));
       std::env::set_var("LOG_LEVEL", "off");
     }
+    let containers = if pg_s3 {
+      Some(start_pg_s3().await)
+    } else {
+      None
+    };
     let app = App::new().await;
     let port = app.port();
     tokio::spawn(app.run());
@@ -86,6 +137,7 @@ impl Server {
       cookie: String::new(),
       token: String::new(),
       _dir: dir,
+      _containers: containers,
     };
     for _ in 0..100 {
       if let Ok(res) = server.client.get(server.url("/health")).send().await
@@ -253,10 +305,20 @@ fn base(path: &str) -> &str {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn push_paths_from_daemon() {
-  if !nix_available() {
-    return;
+  if nix_available() {
+    push_flow(Server::start(false).await).await;
   }
-  let server = Server::start().await;
+}
+
+/// Same flow on the production-like stack (Postgres + S3, needs Docker)
+#[tokio::test(flavor = "multi_thread")]
+async fn push_paths_from_daemon_pg_s3() {
+  if nix_available() {
+    push_flow(Server::start(true).await).await;
+  }
+}
+
+async fn push_flow(server: Server) {
   let dir = TempDir::new().unwrap();
   let paths = make_paths();
   let (a, b, root) = (&paths["a"], &paths["b"], &paths["root"]);
@@ -331,7 +393,7 @@ async fn push_errors() {
   if !nix_available() {
     return;
   }
-  let server = Server::start().await;
+  let server = Server::start(false).await;
   let dir = TempDir::new().unwrap();
   let paths = make_paths();
 

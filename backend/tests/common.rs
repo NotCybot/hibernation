@@ -12,6 +12,11 @@
 //! Downstream caches: new caches default to `https://cache.nixos.org`. [`TestServer::create_cache`] always replaces
 //! that list (empty by default, or a local [`MockServer`] via [`mock_downstream`]) so tests never hit the network.
 //!
+//! [`TestServer::start_pg`] / [`TestServer::start_s3`] / [`TestServer::start_pg_s3`] boot the same server against a
+//! throwaway Postgres / S3 (Adobe S3Mock) container via testcontainers (needs Docker) instead of sqlite / the local
+//! filesystem. The containers live as long as the [`TestServer`]. [`TestServer::db`] and [`TestServer::file_storage`]
+//! always use the exact database and storage config the server was started with.
+//!
 //! Run with the `test` feature so centaurus uses fast RSA keys: `cargo nextest run -p backend --all-features`
 #![allow(dead_code)]
 
@@ -24,15 +29,16 @@ use std::{
   time::Duration,
 };
 
-use backend::App;
+use backend::{App, config::Config};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use centaurus::{
   db::{
     config::DBConfig,
     init::{Connection, connect_db},
   },
-  storage::{FileStorage, StorageConfig},
+  storage::FileStorage,
 };
+use futures_util::StreamExt;
 use harmonia_store_core::store_path::StorePath;
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey, pkcs1::DecodeRsaPublicKey, rand_core::OsRng};
@@ -40,6 +46,14 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use shared::{api::push::CHUNK_SIZE, hash::to_nix_base32, sig::KeyPair};
 use tempfile::TempDir;
+use testcontainers_modules::{
+  postgres::Postgres,
+  testcontainers::{
+    ContainerAsync, GenericImage, ImageExt,
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner,
+  },
+};
 use tokio::{spawn, time::sleep};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
@@ -85,13 +99,58 @@ pub fn prepare_env(dir: &std::path::Path) {
   }
 }
 
+/// Bucket created in the S3Mock container and used by S3 test servers.
+pub const S3_BUCKET: &str = "hibernation";
+
+/// A container the server depends on, kept alive as long as the server.
+pub enum TestContainer {
+  Postgres(ContainerAsync<Postgres>),
+  S3(ContainerAsync<GenericImage>),
+}
+
+/// Start a Postgres container (same major version as production), returns it with its connection URL.
+pub async fn start_pg_container() -> (ContainerAsync<Postgres>, String) {
+  let container = Postgres::default()
+    .with_tag("18-alpine")
+    .start()
+    .await
+    .expect("start postgres container");
+  let url = format!(
+    "postgres://postgres:postgres@{}:{}/postgres",
+    container.get_host().await.unwrap(),
+    container.get_host_port_ipv4(5432).await.unwrap()
+  );
+  (container, url)
+}
+
+/// Start an S3Mock container with an empty [`S3_BUCKET`], returns it with its endpoint (`http://host:port`).
+pub async fn start_s3_container() -> (ContainerAsync<GenericImage>, String) {
+  let container = GenericImage::new("adobe/s3mock", "5.2.3")
+    .with_exposed_port(ContainerPort::Tcp(9090))
+    .with_wait_for(WaitFor::message_on_stdout("Started S3MockApplication"))
+    .with_env_var("COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS", S3_BUCKET)
+    .start()
+    .await
+    .expect("start S3Mock container");
+  let host = format!(
+    "http://{}:{}",
+    container.get_host().await.unwrap(),
+    container.get_host_port_ipv4(9090).await.unwrap()
+  );
+  (container, host)
+}
+
 /// A running test server plus a client (with a hand-rolled cookie jar).
 pub struct TestServer {
   pub port: u16,
   pub client: Client,
-  /// Holds the sqlite db (`db.sqlite`) and the file storage (`storage/`), deleted on drop
+  /// Holds the sqlite db (`db.sqlite`) and the local file storage (`storage/`), deleted on drop. Present (but unused
+  /// for that part) on Postgres / S3 servers too.
   pub dir: TempDir,
   cookies: Mutex<HashMap<String, String>>,
+  /// The config the server was started with (`db_url`, `storage`)
+  pub config: Config,
+  containers: Vec<TestContainer>,
 }
 
 impl TestServer {
@@ -102,11 +161,66 @@ impl TestServer {
 
   /// Like [`TestServer::start`], `env` runs after the defaults are set to override or add env vars.
   pub async fn start_with(env: impl FnOnce()) -> TestServer {
+    Self::start_backends(false, false, env).await
+  }
+
+  /// Boot a server on a Postgres container (local file storage).
+  pub async fn start_pg() -> TestServer {
+    Self::start_backends(true, false, || {}).await
+  }
+
+  /// Boot a server with S3 file storage on an S3Mock container (sqlite database).
+  pub async fn start_s3() -> TestServer {
+    Self::start_backends(false, true, || {}).await
+  }
+
+  /// Boot a production-like server: Postgres database and S3 file storage.
+  pub async fn start_pg_s3() -> TestServer {
+    Self::start_backends(true, true, || {}).await
+  }
+
+  /// Boot a server on Postgres and/or S3 containers (sqlite / local fs otherwise). `env` runs last, after the
+  /// defaults and container env vars are set, e.g. to set `MAX_CONCURRENT_UPLOADS`.
+  pub async fn start_backends(pg: bool, s3: bool, env: impl FnOnce()) -> TestServer {
     let dir = TempDir::new().expect("create temp dir");
     prepare_env(dir.path());
+    let mut containers = Vec::new();
+    // start both containers concurrently
+    let (pg, s3) = tokio::join!(
+      async {
+        if pg {
+          Some(start_pg_container().await)
+        } else {
+          None
+        }
+      },
+      async {
+        if s3 {
+          Some(start_s3_container().await)
+        } else {
+          None
+        }
+      },
+    );
+    if let Some((container, url)) = pg {
+      unsafe { std::env::set_var("DB_URL", url) };
+      containers.push(TestContainer::Postgres(container));
+    }
+    if let Some((container, host)) = s3 {
+      unsafe {
+        std::env::set_var("S3_BUCKET", S3_BUCKET);
+        std::env::set_var("S3_REGION", "us-east-1");
+        std::env::set_var("S3_HOST", host);
+        std::env::set_var("S3_ACCESS_KEY", "test");
+        std::env::set_var("S3_SECRET_KEY", "test");
+        std::env::set_var("S3_FORCE_PATH_STYLE", "true");
+      }
+      containers.push(TestContainer::S3(container));
+    }
     env();
 
-    let app = App::new().await;
+    let config = Config::parse();
+    let app = App::from_config(config.clone()).await;
     let port = app.port();
     spawn(app.run());
 
@@ -121,6 +235,8 @@ impl TestServer {
       client,
       dir,
       cookies: Mutex::new(HashMap::new()),
+      config,
+      containers,
     };
 
     for _ in 0..100 {
@@ -136,30 +252,83 @@ impl TestServer {
 
   /// Boot a server and complete first-run setup with the default admin (session cookie stored).
   pub async fn start_with_admin() -> (TestServer, Uuid) {
-    let server = TestServer::start().await;
+    Self::with_admin(TestServer::start().await).await
+  }
+
+  /// Complete first-run setup with the default admin on an already booted server, e.g.
+  /// `TestServer::with_admin(TestServer::start_pg().await)`.
+  pub async fn with_admin(server: TestServer) -> (TestServer, Uuid) {
     let id = server
       .setup_admin(ADMIN_NAME, ADMIN_EMAIL, ADMIN_PASSWORD)
       .await;
     (server, id)
   }
 
-  /// A second connection to the server's database (no migrations run).
-  pub async fn db(&self) -> Connection {
-    connect_db(&DBConfig::default(), &db_url(self.dir.path())).await
+  pub fn is_pg(&self) -> bool {
+    self.config.db_url.starts_with("postgres")
   }
 
-  /// The local storage directory (`{id}.nar` files, `parts/`).
+  pub fn is_s3(&self) -> bool {
+    self.config.storage.use_s3()
+  }
+
+  /// A second connection to the server's database (no migrations run).
+  pub async fn db(&self) -> Connection {
+    connect_db(&DBConfig::default(), &self.config.db_url).await
+  }
+
+  /// The local storage directory (`{id}.nar` files, `parts/`). Unused by S3 servers.
   pub fn storage_path(&self) -> std::path::PathBuf {
+    assert!(!self.is_s3(), "storage_path() on an S3 server");
     storage_path(self.dir.path())
   }
 
-  /// A [`FileStorage`] on the server's storage directory.
+  /// A [`FileStorage`] with the same storage config as the server (local dir or S3 bucket).
   pub async fn file_storage(&self) -> FileStorage {
-    let config = StorageConfig {
-      storage_path: self.storage_path().to_string_lossy().into_owned(),
-      ..Default::default()
-    };
-    FileStorage::init(&config).await.expect("init storage")
+    FileStorage::init(&self.config.storage)
+      .await
+      .expect("init storage")
+  }
+
+  /// Every object in the server's storage (local or S3) as a `/`-separated key, sorted.
+  pub async fn storage_files(&self) -> Vec<String> {
+    let storage = self.file_storage().await;
+    let mut files: Vec<String> = storage
+      .list(None)
+      .map(|meta| meta.expect("list storage").location.to_string())
+      .collect()
+      .await;
+    files.sort();
+    files
+  }
+
+  /// In-progress S3 multipart uploads as `(key, upload id)`, via S3Mock's unsigned `GET /{bucket}?uploads`.
+  pub async fn s3_multipart_uploads(&self) -> Vec<(String, String)> {
+    assert!(
+      self.is_s3(),
+      "s3_multipart_uploads() on a local storage server"
+    );
+    let host = self.config.storage.s3_host.as_ref().unwrap();
+    let xml = self
+      .client
+      .get(format!("{host}/{S3_BUCKET}?uploads"))
+      .send()
+      .await
+      .unwrap()
+      .error_for_status()
+      .unwrap()
+      .text()
+      .await
+      .unwrap();
+    fn tag<'a>(s: &'a str, name: &str) -> &'a str {
+      let start = s.find(&format!("<{name}>")).unwrap() + name.len() + 2;
+      &s[start..start + s[start..].find("</").unwrap()]
+    }
+    xml
+      .split("<Upload>")
+      .skip(1)
+      .map(|u| (tag(u, "Key").to_string(), tag(u, "UploadId").to_string()))
+      .collect()
   }
 
   /// Full URL under the `/api` prefix, e.g. `url("/auth/config")`.

@@ -262,7 +262,8 @@ pub async fn age_uploads(db: &DatabaseConnection) {
 
 // ---- storage ----
 
-/// Every file below the storage dir as a `/`-separated relative path, sorted.
+/// Every file below the local storage dir as a `/`-separated relative path, sorted (local fs only, see
+/// `TestServer::storage_files` for an S3-aware async version).
 pub fn storage_files(server: &TestServer) -> Vec<String> {
   fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {

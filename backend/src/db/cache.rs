@@ -114,6 +114,8 @@ impl<'db> CacheTable<'db> {
         .select_only()
         .column(cache::Column::Id)
         .column(cache::Column::Name)
+        // the cache_access join yields one row per access entry
+        .distinct()
         .into_model::<SimpleCacheInfo>()
         .all(self.db)
         .await?,
