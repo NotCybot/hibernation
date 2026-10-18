@@ -133,13 +133,15 @@ async fn expired_cli_token_is_bad_request() {
 #[tokio::test]
 async fn cached_token_is_rechecked_once_it_expires() {
   let (server, admin) = TestServer::start_with_admin().await;
-  let (token, _) = server
-    .create_cli_token_exp("short", Utc::now() + Duration::seconds(2))
-    .await;
+  // generous window: under load, setup can eat seconds before the first (caching) use
+  let exp = Utc::now() + Duration::seconds(5);
+  let (token, _) = server.create_cli_token_exp("short", exp).await;
   let res = whoami(cache_test(&server).bearer_auth(&token)).await;
   assert_eq!(res, (StatusCode::OK, admin.to_string()));
 
-  tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+  // sleep relative to the expiry, not a fixed amount
+  let left = (exp - Utc::now()).to_std().unwrap_or_default();
+  tokio::time::sleep(left + std::time::Duration::from_millis(500)).await;
   let (status, _) = whoami(cache_test(&server).bearer_auth(&token)).await;
   assert_eq!(status, StatusCode::BAD_REQUEST);
 }

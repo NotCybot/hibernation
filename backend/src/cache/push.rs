@@ -51,6 +51,8 @@ use crate::{
 
 /// S3 allows at most 10000 parts per multipart upload
 const MAX_PARTS: usize = 10000;
+/// S3 rejects completing a multipart upload with a part smaller than this, except the last one
+const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 
 pub fn router() -> ApiRouter {
   ApiRouter::new()
@@ -484,6 +486,12 @@ async fn store_upload(
 
   let name = nar_name(upload.nar_id);
   if let (Some(id), Some(multipart)) = (&upload.multipart, storage.multipart()) {
+    if parts[..parts.len() - 1]
+      .iter()
+      .any(|(_, size)| *size < MIN_PART_SIZE)
+    {
+      bail!("Upload parts except the last must be at least 5 MiB");
+    }
     multipart
       .complete_multipart(&name, id, parts.into_iter().map(|(p, _)| p).collect())
       .await

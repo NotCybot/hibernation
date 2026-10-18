@@ -591,13 +591,14 @@ async fn chunk_concurrency_is_limited() {
     )
     .await
     .unwrap();
-  tokio::time::sleep(Duration::from_millis(300)).await;
+  // ponytail: no hook to observe the permit, so give the held request ample time to take it under load
+  tokio::time::sleep(Duration::from_millis(1500)).await;
 
   let blocked = server
     .raw(Method::POST, &format!("/cache/push/{upload_id}/0"))
     .bearer_auth(&token)
     .body(a.file.clone())
-    .timeout(Duration::from_millis(500))
+    .timeout(Duration::from_millis(1000))
     .send()
     .await;
   assert!(

@@ -75,3 +75,4 @@ uuid = { version = "=1.28.0", features = ["v4"] }
 tempfile = "=3.27.0"
 wiremock = "=0.6.5"
 ed25519-compact = "=2.6.0"
+testcontainers-modules = { version = "=0.15.0", features = ["postgres"] }
