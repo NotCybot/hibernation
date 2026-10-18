@@ -47,7 +47,8 @@
     data.config?.then(async (d) => {
       config = d;
 
-      if (!oidcUrl) {
+      // Only ask for a provider url when SSO is actually configured.
+      if (!oidcUrl && config?.sso_type === SsoType.OIDC) {
         oidcUrl = await getOidcUrl(data.redirectTo);
         if (config?.instant_redirect && oidcUrl && !data.skip) {
           window.location.href = oidcUrl;
@@ -131,7 +132,7 @@
           </FormInputPassword>
         {/snippet}
       </BaseForm>
-      {#if config?.sso_type !== SsoType.NONE}
+      {#if config?.sso_type === SsoType.OIDC}
         <FieldSeparator
           class="*:data-[slot=field-separator-content]:bg-card my-4"
           >Or continue with</FieldSeparator

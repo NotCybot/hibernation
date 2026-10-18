@@ -8,6 +8,11 @@ import type {
   TDataShape
 } from './client';
 import { client } from './client.gen';
+import {
+  listTokensResponseTransformer,
+  searchStorePathsResponseTransformer,
+  tokenInfoResponseTransformer
+} from './transformers.gen';
 import type {
   AuthConfigData,
   AuthConfigErrors,
@@ -914,6 +919,7 @@ export const searchStorePaths = <ThrowOnError extends boolean = false>(
     SearchStorePathsErrors,
     ThrowOnError
   >({
+    responseTransformer: searchStorePathsResponseTransformer,
     url: '/api/cache/management/{uuid}/search',
     ...options,
     headers: {
@@ -1026,7 +1032,11 @@ export const listTokens = <ThrowOnError extends boolean = false>(
     ListTokensResponses,
     ListTokensErrors,
     ThrowOnError
-  >({ url: '/api/token', ...options });
+  >({
+    responseTransformer: listTokensResponseTransformer,
+    url: '/api/token',
+    ...options
+  });
 
 export const createToken = <ThrowOnError extends boolean = false>(
   options: Options<CreateTokenData, ThrowOnError>
@@ -1080,7 +1090,11 @@ export const tokenInfo = <ThrowOnError extends boolean = false>(
     TokenInfoResponses,
     TokenInfoErrors,
     ThrowOnError
-  >({ url: '/api/token/{uuid}', ...options });
+  >({
+    responseTransformer: tokenInfoResponseTransformer,
+    url: '/api/token/{uuid}',
+    ...options
+  });
 
 export const tokenRegenerate = <ThrowOnError extends boolean = false>(
   options: Options<TokenRegenerateData, ThrowOnError>

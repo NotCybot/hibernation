@@ -22,6 +22,12 @@
   let form: FormDialog<typeof emailChangeSchema> | undefined = $state();
   let formOpen = $state(false);
 
+  // Totp6 puts the label's target id on its wrapper, not the real <input>, so
+  // name the input directly for assistive tech (and label-based queries).
+  const labelInput = (label: string) => (node: HTMLElement) => {
+    node.querySelector('input')?.setAttribute('aria-label', label);
+  };
+
   const changeConfirm = async (
     formData: FormValue<typeof emailChangeSchema>
   ) => {
@@ -74,7 +80,7 @@
         newEmail = formData.email;
         form?.setValue({
           ...formData,
-          email_input: true
+          email_input: false
         });
         return { error: '' };
       }
@@ -86,19 +92,25 @@
   <h5>Email:</h5>
   <Tooltip.Provider>
     <Tooltip.Root>
-      <Tooltip.Trigger class="ml-auto">
-        <Button
-          variant="secondary"
-          class="cursor-pointer"
-          disabled={!mailActive}
-          onclick={() => {
-            formOpen = true;
-          }}
-        >
-          Change Email
-        </Button>
+      <Tooltip.Trigger>
+        <!-- A span (not a nested button) hosts the tooltip so it still shows
+             while the button is disabled. -->
+        {#snippet child({ props })}
+          <span {...props} class="ml-auto">
+            <Button
+              variant="secondary"
+              class="cursor-pointer"
+              disabled={!mailActive || oidc}
+              onclick={() => {
+                formOpen = true;
+              }}
+            >
+              Change Email
+            </Button>
+          </span>
+        {/snippet}
       </Tooltip.Trigger>
-      {#if !mailActive}
+      {#if !mailActive || oidc}
         <Tooltip.Content side="left">
           {#if oidc}
             <p>
@@ -135,7 +147,10 @@
         />
       {:else}
         <div class="space-y-4">
-          <div class="space-y-2">
+          <div
+            class="space-y-2"
+            {@attach labelInput(`Code from old Email (${email})`)}
+          >
             <Totp6
               label={`Code from old Email (${email})`}
               key="old_code"
@@ -143,7 +158,10 @@
               class="flex justify-center"
             />
           </div>
-          <div class="space-y-2">
+          <div
+            class="space-y-2"
+            {@attach labelInput(`Code from new Email (${newEmail})`)}
+          >
             <Totp6
               label={`Code from new Email (${newEmail})`}
               key="new_code"

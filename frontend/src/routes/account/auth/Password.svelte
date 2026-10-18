@@ -40,10 +40,10 @@
     });
 
     if (response?.status !== 200) {
-      if (response?.status === 401) {
+      if (response?.status === 403) {
         return {
-          error: 'Passwords are not equal',
-          field: 'password_confirm'
+          error: 'Old password is incorrect',
+          field: 'old_password'
         } as const;
       } else {
         return { error: 'Error while updating password' };
@@ -60,17 +60,23 @@
   <h5>Password:</h5>
   <Tooltip.Provider>
     <Tooltip.Root>
-      <Tooltip.Trigger class="ml-auto">
-        <Button
-          variant="secondary"
-          class="cursor-pointer"
-          disabled={oidc}
-          onclick={() => {
-            formOpen = true;
-          }}
-        >
-          Change Password
-        </Button>
+      <Tooltip.Trigger>
+        <!-- A span (not a nested button) hosts the tooltip so it still shows
+             while the button is disabled. -->
+        {#snippet child({ props })}
+          <span {...props} class="ml-auto">
+            <Button
+              variant="secondary"
+              class="cursor-pointer"
+              disabled={oidc}
+              onclick={() => {
+                formOpen = true;
+              }}
+            >
+              Change Password
+            </Button>
+          </span>
+        {/snippet}
       </Tooltip.Trigger>
       {#if oidc}
         <Tooltip.Content side="left">

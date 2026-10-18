@@ -175,6 +175,7 @@
                 {...props}
                 key="users"
                 label="Group Members"
+                disabled={readonly || props.disabled}
                 data={users?.map((user) => ({
                   label: user.name,
                   value: user.id
@@ -208,7 +209,7 @@
           <Button
             class="ml-auto cursor-pointer"
             type="submit"
-            disabled={isLoading}
+            disabled={isLoading || readonly}
             variant={isError ? 'destructive' : undefined}
           >
             {#if isLoading}

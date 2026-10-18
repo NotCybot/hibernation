@@ -34,13 +34,13 @@ export const columns = ({
     'Size',
     (value: number) => `${(value / (1024 * 1024)).toFixed(2)} MiB`
   ),
-  createColumn('created_at', 'Created At', (value: string) =>
+  createColumn('created_at', 'Created At', (value: Date) =>
     new Date(value).toLocaleString(navigator.languages || [navigator.language])
   ),
   createColumn(
     'last_accessed_at',
     'Last Accessed At',
-    (value: string | undefined) =>
+    (value: Date | null | undefined) =>
       value
         ? new Date(value).toLocaleString(
             navigator.languages || [navigator.language]

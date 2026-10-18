@@ -40,9 +40,21 @@
   const submit = async (rawData: object) => {
     if ((rawData as any).oidc) {
       let formData: FormValue<typeof userSettings> = rawData as any;
+      let fromEnv = data.settings?.from_env ?? [];
+
+      // The shared schema only requires these once `oidc_enabled` is set, but
+      // choosing this path enables OIDC, so require them unless env provides them.
+      for (const field of ['oidc_issuer', 'oidc_client_id'] as const) {
+        if (!formData[field] && !fromEnv.includes(field)) {
+          return {
+            field,
+            error: 'This field is required for OpenID Connect setup.'
+          } as const;
+        }
+      }
 
       let ret = await initOidc({
-        body: reformat(formData, data.settings?.from_env ?? [])
+        body: reformat(formData, fromEnv)
       });
 
       if (ret.error) {

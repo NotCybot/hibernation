@@ -21,8 +21,14 @@
     data.user.then((u) => (user = u));
   });
 
+  let loadFailed = $state(false);
+
   $effect(() => {
-    data.caches.then((c) => (caches = c));
+    data.caches.then((c) => {
+      // The load resolves `undefined` when the API call failed.
+      loadFailed = !c;
+      caches = c ?? [];
+    });
   });
 
   let errorToasted = false;
@@ -62,6 +68,8 @@
     >
       {#if !caches}
         <p class="text-muted-foreground">Loading caches...</p>
+      {:else if loadFailed}
+        <p class="text-destructive">Failed to load caches.</p>
       {:else if (caches?.length ?? 0) === 0}
         <p class="text-muted-foreground">
           No caches found. Create one to get started.

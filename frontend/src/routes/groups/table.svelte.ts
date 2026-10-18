@@ -7,6 +7,9 @@ import { Permission } from '$lib/permissions.svelte';
 import type { GroupInfo, SimpleUserInfo, UserInfo } from '$lib/client';
 import Actions from '@profidev/pleiades/components/table/actions.svelte';
 
+/** A list row plus the derived search field added by `searchable`. */
+export type GroupRow = GroupInfo & { user_names?: string };
+
 export const columns = ({
   deleteGroup,
   user,
@@ -15,7 +18,7 @@ export const columns = ({
   deleteGroup: (group: GroupInfo) => void;
   user?: UserInfo;
   admin_group?: string;
-}): TableColumnDef<GroupInfo>[] => [
+}): TableColumnDef<GroupRow>[] => [
   createColumn('name', 'Name'),
   createColumn(
     'permissions',
@@ -49,3 +52,13 @@ export const columns = ({
     header: () => {}
   }
 ];
+
+/**
+ * The table search stringifies each search column; `users` is an object
+ * array, so expose the member names as a plain searchable string.
+ */
+export const searchable = (groups: GroupInfo[]): GroupRow[] =>
+  groups.map((group) => ({
+    ...group,
+    user_names: group.users.map((u) => u.name).join(', ')
+  }));

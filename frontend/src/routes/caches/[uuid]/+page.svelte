@@ -4,11 +4,13 @@
   import { ScrollArea } from '@profidev/pleiades/components/ui/scroll-area';
   import { size_to_gib } from '$lib/backend/util.svelte.js';
   import type { CacheDetails, GeneralSettings } from '$lib/client/types.gen.js';
+  import { page } from '$app/state';
 
   let { data } = $props();
 
   let cacheInfo: CacheDetails | undefined = $state();
-  let generalSettings: GeneralSettings | undefined = $state();
+  // `undefined` while loading, `null` when the settings could not be loaded.
+  let generalSettings: GeneralSettings | null | undefined = $state();
 
   $effect(() => {
     data.cacheRes.then((res) => {
@@ -18,7 +20,7 @@
 
   $effect(() => {
     data.generalSettings.then((res) => {
-      generalSettings = res;
+      generalSettings = res ?? null;
     });
   });
 
@@ -27,14 +29,19 @@
   let usage_percent = $derived((size_gib / quota_gib) * 100);
 
   const url = $derived.by(() => {
-    let siteUrl = new URL(generalSettings?.site_url || 'localhost:5173');
+    if (!cacheInfo || generalSettings === undefined) return 'Loading...';
+    // Fall back to the current origin if the settings failed to load.
+    let siteUrl = new URL(generalSettings?.site_url || page.url.origin);
     if (generalSettings?.virtual_host_routing) {
-      siteUrl.host = `${cacheInfo?.name}.${siteUrl.host}`;
+      // The host router maps `<cache>.<host>/<path>` to `/api/nix/<cache>/<path>`.
+      siteUrl.host = `${cacheInfo.name}.${siteUrl.host}`;
       return siteUrl.origin;
-    } else {
-      siteUrl.pathname = `/api/nix/${cacheInfo?.name}`;
-      return siteUrl.href;
     }
+    // Resolve relative to site_url so a base path (e.g. a proxy prefix) is kept.
+    if (!siteUrl.pathname.endsWith('/')) {
+      siteUrl.pathname += '/';
+    }
+    return new URL(`api/nix/${cacheInfo.name}`, siteUrl).href;
   });
   const nixConfig = $derived(`{
   nixConfig = {

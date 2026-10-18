@@ -12,6 +12,7 @@
     "prettier-plugin-tailwindcss": "0.8.1"
   },
   "allowScripts": {
-    "sharp": true
+    "sharp": true,
+    "msw": true
   }
 }

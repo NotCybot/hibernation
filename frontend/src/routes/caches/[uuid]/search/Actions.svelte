@@ -15,6 +15,7 @@
     size="icon"
     class="cursor-pointer"
     variant="destructive"
+    aria-label="Delete store path"
     onclick={remove}
     disabled={delete_disabled}
   >
