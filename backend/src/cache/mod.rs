@@ -14,11 +14,11 @@ use crate::{
   config::Config,
 };
 
-mod cleanup;
-mod dedupe;
-mod management;
-mod push;
-mod state;
+pub mod cleanup;
+pub mod dedupe;
+pub mod management;
+pub mod push;
+pub mod state;
 
 pub fn router() -> ApiRouter {
   ApiRouter::new()

@@ -27,6 +27,11 @@ pub struct CacheMapping {
   pub access_type: AccessType,
 }
 
+/// Whether two mapping lists grant the same access, ignoring order.
+pub fn same_mappings(a: &[CacheMapping], b: &[CacheMapping]) -> bool {
+  a.len() == b.len() && a.iter().all(|m| b.contains(m)) && b.iter().all(|m| a.contains(m))
+}
+
 impl<'db> GroupTableExt<'db> {
   pub fn new(db: &'db DatabaseConnection) -> Self {
     Self { db }

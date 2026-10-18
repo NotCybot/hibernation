@@ -57,7 +57,7 @@ pub fn start(db: Connection, storage: FileStorage, local_path: Option<PathBuf>) 
 }
 
 /// Removes files no db entry knows about, e.g. left behind by crashes or older versions
-async fn run_sweep(db: &Connection, storage: &FileStorage) -> Result<()> {
+pub async fn run_sweep(db: &Connection, storage: &FileStorage) -> Result<()> {
   let cut_off = Utc::now() - chrono::Duration::hours(1);
   let files = storage
     .list(None)
@@ -90,7 +90,7 @@ async fn run_sweep(db: &Connection, storage: &FileStorage) -> Result<()> {
 
 /// Local storage writes to `<path>#<n>` first and renames when done. A crash mid-write leaves these behind and
 /// they are hidden from `list`, so they are removed by walking the directory instead.
-fn sweep_staging_files(dir: &Path) -> std::io::Result<usize> {
+pub fn sweep_staging_files(dir: &Path) -> std::io::Result<usize> {
   let cut_off = SystemTime::now() - Duration::from_hours(1);
   let mut deleted = 0;
   // Files and directories vanish while uploads are running, that is not an error
@@ -140,7 +140,7 @@ impl StoredFile {
   }
 }
 
-async fn run_cleanup(db: &Connection, storage: &FileStorage) {
+pub async fn run_cleanup(db: &Connection, storage: &FileStorage) {
   // Runs first so files of uploads that already created their nar entry are picked up by the orphan cleanup below
   match db.nar().stale_uploads().await {
     Ok(stale) => {

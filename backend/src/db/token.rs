@@ -56,18 +56,15 @@ impl<'db> TokenTable<'db> {
     )
   }
 
-  pub async fn replace(&self, user: Uuid, id: Uuid, hash: String) -> Result<(), DbErr> {
-    let mut token = self.by_id(id).await?.into_active_model();
-    if token.user_id.as_ref() != &user {
-      return Err(DbErr::RecordNotFound(format!(
-        "Token with id {} not found for user {}",
-        id, user
-      )));
-    }
-
-    token.token = Set(hash);
-    token.update(self.db).await?;
-    Ok(())
+  /// Returns `false` if no token with this id belongs to `user`.
+  pub async fn replace(&self, user: Uuid, id: Uuid, hash: String) -> Result<bool, DbErr> {
+    let res = Token::update_many()
+      .col_expr(token::Column::Token, Expr::value(hash))
+      .filter(token::Column::Id.eq(id))
+      .filter(token::Column::UserId.eq(user))
+      .exec(self.db)
+      .await?;
+    Ok(res.rows_affected > 0)
   }
 
   pub async fn get_by_token(&self, token: &str) -> Result<token::Model, DbErr> {
@@ -117,23 +114,21 @@ impl<'db> TokenTable<'db> {
     Ok(())
   }
 
+  /// Returns `false` if no token with this id belongs to `user`.
   pub async fn update(
     &self,
     user: Uuid,
     id: Uuid,
     name: String,
     exp: DateTime,
-  ) -> Result<(), DbErr> {
-    let mut token = self.by_id(id).await?.into_active_model();
-    if token.user_id.as_ref() != &user {
-      return Err(DbErr::RecordNotFound(format!(
-        "Token with id {} not found for user {}",
-        id, user
-      )));
-    }
-    token.name = Set(name);
-    token.exp = Set(exp);
-    token.update(self.db).await?;
-    Ok(())
+  ) -> Result<bool, DbErr> {
+    let res = Token::update_many()
+      .col_expr(token::Column::Name, Expr::value(name))
+      .col_expr(token::Column::Exp, Expr::value(exp))
+      .filter(token::Column::Id.eq(id))
+      .filter(token::Column::UserId.eq(user))
+      .exec(self.db)
+      .await?;
+    Ok(res.rows_affected > 0)
   }
 }

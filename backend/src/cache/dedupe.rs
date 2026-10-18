@@ -19,7 +19,7 @@ pub fn start(db: Connection) {
   });
 }
 
-async fn run_dedupe(db: &Connection) {
+pub async fn run_dedupe(db: &Connection) {
   let duplicates = match db.nar().find_duplicate_nars().await {
     Ok(dups) => dups,
     Err(e) => {

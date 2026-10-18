@@ -49,14 +49,27 @@ pub fn state(router: ApiRouter) -> ApiRouter {
 
     async move {
       loop {
-        let now = Instant::now();
-        codes.retain(|_, (time, _)| now.duration_since(*time).as_secs() < 300);
+        codes.retain(|_, (time, _)| time.elapsed() < CODE_TTL);
         sleep(Duration::from_secs(600)).await;
       }
     }
   });
 
   router.layer(Extension(cli_state))
+}
+
+const CODE_TTL: Duration = Duration::from_secs(300);
+
+/// Consume a login code, returning the user it was issued for. Removal is atomic so a code can only ever be
+/// exchanged once, even by concurrent requests.
+fn take_code(codes: &DashMap<Uuid, (Instant, Uuid)>, code: &Uuid) -> Result<Uuid> {
+  let Some((_, (issued, user))) = codes.remove(code) else {
+    bail!("Invalid code");
+  };
+  if issued.elapsed() > CODE_TTL {
+    bail!("Invalid user or code");
+  }
+  Ok(user)
 }
 
 #[derive(FromRequestParts, Clone, OperationIo)]
@@ -91,14 +104,7 @@ async fn get_token(
   pw: PasswordState,
   updater: Updater,
 ) -> Result<String> {
-  let Some((instant, user)) = state.codes.get(&token_req.code).map(|entry| *entry.value()) else {
-    bail!("Invalid code");
-  };
-
-  state.codes.remove(&token_req.code);
-  if Instant::now().duration_since(instant).as_secs() > 300 {
-    bail!("Invalid user or code");
-  }
+  let user = take_code(&state.codes, &token_req.code)?;
 
   let Some(exp) = Utc::now().checked_add_signed(chrono::Duration::seconds(jwt.exp)) else {
     bail!(INTERNAL_SERVER_ERROR, "Failed to create token");
@@ -133,4 +139,55 @@ pub fn gen_token() -> String {
   (0..CLI_TOKEN_LEN)
     .map(|_| rng.sample(Alphanumeric) as char)
     .collect()
+}
+
+#[cfg(test)]
+mod test {
+  use std::time::{Duration, Instant};
+
+  use dashmap::DashMap;
+  use http::StatusCode;
+  use uuid::Uuid;
+
+  use super::{CODE_TTL, gen_token, take_code};
+  use crate::auth::cli_auth::CLI_TOKEN_LEN;
+
+  #[test]
+  fn take_code_is_single_use() {
+    let codes = DashMap::new();
+    let (code, user) = (Uuid::new_v4(), Uuid::new_v4());
+    codes.insert(code, (Instant::now(), user));
+
+    assert_eq!(take_code(&codes, &code).unwrap(), user);
+    assert!(codes.is_empty());
+    let err = take_code(&codes, &code).unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+  }
+
+  #[test]
+  fn take_code_unknown_is_bad_request() {
+    let codes = DashMap::new();
+    let err = take_code(&codes, &Uuid::new_v4()).unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+  }
+
+  #[test]
+  fn take_code_expired_is_rejected_and_removed() {
+    let codes = DashMap::new();
+    let code = Uuid::new_v4();
+    let issued = Instant::now() - CODE_TTL - Duration::from_secs(1);
+    codes.insert(code, (issued, Uuid::new_v4()));
+
+    let err = take_code(&codes, &code).unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(codes.is_empty());
+  }
+
+  #[test]
+  fn gen_token_is_random_alphanumeric_of_cli_len() {
+    let a = gen_token();
+    assert_eq!(a.len(), CLI_TOKEN_LEN);
+    assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    assert_ne!(a, gen_token());
+  }
 }
