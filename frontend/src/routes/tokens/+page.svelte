@@ -7,7 +7,7 @@
   import { columns } from './table.svelte';
   import { z } from 'zod';
   import { toast } from '@profidev/pleiades/components/util/general';
-  import { afterNavigate } from '$app/navigation';
+  import { afterNavigate, invalidate } from '$app/navigation';
   import {
     deleteExpiredTokens,
     deleteToken,
@@ -64,6 +64,7 @@
       return { error: 'Failed to delete token' };
     } else {
       toast.success(`Token ${selected.name} deleted successfully`);
+      invalidate('/api/token');
     }
   };
 
@@ -76,6 +77,7 @@
       return { error: 'Failed to delete expired tokens' };
     }
 
+    invalidate('/api/token');
     const deleted = ret.data?.deleted ?? 0;
     if (deleted === 0) {
       toast.success('No expired tokens to delete');

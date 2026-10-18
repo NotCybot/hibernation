@@ -57,7 +57,11 @@ async fn main() -> Result<()> {
     .clone()
     .or_else(|| config.as_ref().map(|c| c.app_url.clone()));
 
-  cli.run(config, url).await?;
+  if let Err(e) = cli.run(config, url, tty).await {
+    eprintln!("Error: {e:?}");
+    std::process::exit(1);
+  }
 
-  Ok(())
+  // Tokio does not exit when other tasks are still running (e.g. blocking stdin reads)
+  std::process::exit(0);
 }

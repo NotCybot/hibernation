@@ -1,20 +1,13 @@
 import { EvictionPolicy } from '$lib/client';
 import { z } from 'zod';
+import { cacheName } from '../../create/schema.svelte';
 
 export const cacheSchema = z.object({
   allow_force_push: z.boolean().default(false),
   eviction_policy: z
     .array(z.enum(EvictionPolicy))
     .default([EvictionPolicy.LEAST_RECENTLY_USED]),
-  name: z
-    .string()
-    .min(1, 'Cache name cannot be empty')
-    .max(63, 'Cache name is too long (max 63 characters)')
-    .regex(
-      /^(?![0-9-])[a-zA-Z0-9-]{0,62}(?<!-)$/,
-      'Cache name must be lowercase, alphanumeric, and cannot start or end with a hyphen'
-    )
-    .default(''),
+  name: cacheName.default(''),
   priority: z
     .number()
     .int()

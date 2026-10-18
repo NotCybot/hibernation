@@ -13,7 +13,9 @@ export default defineConfig({
       name: '@hey-api/typescript'
     },
     {
-      name: '@hey-api/sdk'
+      name: '@hey-api/sdk',
+      // Parse ISO date strings into `Date`s, matching the generated types.
+      transformer: true
     },
     {
       bigInt: false,
@@ -23,6 +25,9 @@ export default defineConfig({
       baseUrl: '',
       name: '@hey-api/client-fetch',
       runtimeConfigPath: '$lib/backend/config'
+    },
+    {
+      name: 'msw'
     }
   ]
 });

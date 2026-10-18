@@ -7,6 +7,7 @@ mod m20260319_194332_nar_info;
 mod m20260320_164249_cache_access;
 mod m20260806_134347_nar_info_last_accessed_not_null;
 mod m20261017_120000_nar_upload;
+mod m20261017_130000_nar_info_unique_store_path;
 
 pub struct Migrator;
 
@@ -28,6 +29,7 @@ impl MigratorTrait for Migrator {
       Box::new(centaurus::db::migrations::m6_user_oidc_subject::Migration),
       Box::new(m20260806_134347_nar_info_last_accessed_not_null::Migration),
       Box::new(m20261017_120000_nar_upload::Migration),
+      Box::new(m20261017_130000_nar_info_unique_store_path::Migration),
     ]
   }
 }

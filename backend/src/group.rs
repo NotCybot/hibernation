@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::db::{
   DBTrait,
   cache::SimpleCacheInfo,
-  group_ext::{CacheMapping, GroupDetails},
+  group_ext::{CacheMapping, GroupDetails, same_mappings},
 };
 use crate::nix::NixCache;
 use crate::utils::{CacheEdit, UpdateMessage, Updater};
@@ -24,7 +24,12 @@ pub fn router() -> ApiRouter {
   ApiRouter::new()
     .api_route("/", list_groups_route())
     .api_route("/", create_group_route::<UpdateMessage>())
-    .api_route("/", delete_group_route::<UpdateMessage>())
+    // deleting a group can revoke cache access and permissions
+    .api_route(
+      "/",
+      delete_group_route::<UpdateMessage>()
+        .layer(axum::middleware::from_fn(crate::user::clear_auth_caches)),
+    )
     .api_route("/", put_with(edit_group, |op| op.id("editGroup")))
     .api_route("/{uuid}", get_with(group_info, |op| op.id("groupInfo")))
     .api_route("/users", list_users_simple_route())
@@ -118,10 +123,12 @@ async fn edit_group(
   }
 
   // only allow changing cache mappings if the user has the general cache edit permission
-  if group.caches != data.caches && !user_permissions.contains(&CacheEdit::name().to_string()) {
+  if !same_mappings(&group.caches, &data.caches)
+    && !user_permissions.contains(&CacheEdit::name().to_string())
+  {
     bail!(
       FORBIDDEN,
-      "Cannot edit cache mappings via the group edit endpoint"
+      "Cannot edit cache mappings without the cache edit permission"
     );
   }
 

@@ -12,10 +12,10 @@ export const columns = ({
   deleteToken: (token: TokenInfo) => void;
 }): TableColumnDef<TokenInfo>[] => [
   createColumn('name', 'Name'),
-  createColumn('exp', 'Expires At', (value: string) =>
+  createColumn('exp', 'Expires At', (value: Date) =>
     new Date(value).toLocaleString(navigator.languages || [navigator.language])
   ),
-  createColumn('last_used', 'Last Used', (value: string | undefined) =>
+  createColumn('last_used', 'Last Used', (value: Date | null | undefined) =>
     value
       ? new Date(value).toLocaleString(
           navigator.languages || [navigator.language]

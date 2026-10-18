@@ -64,12 +64,22 @@ impl Deref for CacheRegex {
   }
 }
 
+impl Default for CacheRegex {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl CacheRegex {
   pub fn new() -> Self {
     // Cache names must be 1-63 characters, can contain letters, numbers, and hyphens,
     // but cannot start or end with a hyphen or be purely numeric.
     let regex = Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").unwrap();
     CacheRegex(regex)
+  }
+
+  pub fn is_valid(&self, name: &str) -> bool {
+    self.is_match(name) && name.len() <= 63 && !name.bytes().all(|b| b.is_ascii_digit())
   }
 }
 
@@ -114,7 +124,7 @@ async fn create_cache(
   regex: CacheRegex,
   Json(req): Json<CreateCacheRequest>,
 ) -> Result<Json<CreateCacheResponse>> {
-  if !regex.is_match(&req.name) || req.name.len() > 63 {
+  if !regex.is_valid(&req.name) {
     bail!(BAD_REQUEST, "Invalid cache name format");
   }
 
@@ -126,7 +136,7 @@ async fn create_cache(
     bail!(NOT_ACCEPTABLE, "Invalid signature key format");
   }
 
-  let quota = req.quota.max(0) * 1024 * 1024; // Convert from MiB to bytes, ensuring non-negative
+  let quota = req.quota.max(0).saturating_mul(1024 * 1024); // Convert from MiB to bytes, ensuring non-negative
   let uuid = db
     .cache()
     .create_cache(req.name, req.public, quota, req.sig_key, auth.user_id)
@@ -235,7 +245,7 @@ async fn edit_cache(
     bail!(BAD_REQUEST, "Priority must be non-negative");
   }
 
-  if !regex.is_match(&req.name) || req.name.len() > 63 {
+  if !regex.is_valid(&req.name) {
     bail!(BAD_REQUEST, "Invalid cache name format");
   }
 
@@ -266,9 +276,9 @@ async fn edit_cache(
   }
 
   let lock = lock.lock_cache(path.uuid).await;
-  let Some(info) = db.cache().by_id(path.uuid).await? else {
+  if db.cache().by_id(path.uuid).await?.is_none() {
     bail!("Cache not found");
-  };
+  }
 
   let Some(size) = db.cache().cache_size(path.uuid).await? else {
     bail!("Cache not found");
@@ -277,7 +287,7 @@ async fn edit_cache(
   let diff = size - req.quota;
   if diff > 0 {
     db.cache()
-      .evict(path.uuid, diff, info.eviction_policy)
+      .evict(path.uuid, diff, req.eviction_policy.clone())
       .await?;
   }
 
@@ -344,4 +354,32 @@ async fn delete_path(
 
   db.nar().delete_path(path.uuid, &req.store_path).await?;
   Ok(())
+}
+
+#[cfg(test)]
+mod test {
+  use super::CacheRegex;
+
+  #[test]
+  fn cache_name_validation() {
+    let regex = CacheRegex::default();
+    for name in ["a", "main", "My-Cache", "a1", "1a", "0-0", &"a".repeat(63)] {
+      assert!(regex.is_valid(name), "{name} should be valid");
+    }
+    for name in [
+      "",
+      "-a",
+      "a-",
+      "-",
+      "a_b",
+      "a.b",
+      "a b",
+      "ä",
+      "1",
+      "123",
+      &"a".repeat(64),
+    ] {
+      assert!(!regex.is_valid(name), "{name} should be invalid");
+    }
+  }
 }

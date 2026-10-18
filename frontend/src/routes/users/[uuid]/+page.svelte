@@ -51,6 +51,7 @@
   let convertOpen = $state(false);
   let isLoading = $state(false);
   let readonly = $state(true);
+  let canEditCaches = $state(false);
   let allowSpecialEdit = $state(false);
   let userInfo: DetailUserInfo | undefined = $state();
   let groups: SimpleGroupInfo[] = $state([]);
@@ -73,6 +74,7 @@
       userInfo = detailUserInfo;
       form?.setValue(formatData(detailUserInfo));
       readonly = !user.permissions.includes(Permission.USER_EDIT);
+      canEditCaches = user.permissions.includes(Permission.CACHE_EDIT);
       allowSpecialEdit = detailUserInfo.permissions.every((perm) =>
         user.permissions.includes(perm)
       );
@@ -350,9 +352,7 @@
               <CacheAccess
                 {caches}
                 bind:mappings
-                disabled={!userInfo?.permissions.includes(
-                  Permission.CACHE_EDIT
-                ) || isLoading}
+                disabled={!canEditCaches || isLoading}
               />
             </div>
           </div>

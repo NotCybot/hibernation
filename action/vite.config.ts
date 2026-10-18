@@ -1,4 +1,4 @@
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import { builtinModules } from 'node:module';
 
 export default defineConfig({
@@ -13,5 +13,13 @@ export default defineConfig({
     },
     sourcemap: true
   },
-  plugins: []
+  plugins: [],
+  test: {
+    include: ['src/tests/**/*.test.ts'],
+    coverage: {
+      include: ['src/**/*.ts'],
+      exclude: ['src/tests/**'],
+      reporter: ['text', 'lcov']
+    }
+  }
 });

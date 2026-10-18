@@ -191,7 +191,7 @@
           />
           <FormSelect
             {...props}
-            {readonly}
+            disabled={readonly || props.disabled}
             key="eviction_policy"
             label="Eviction Policy"
             single
@@ -210,6 +210,7 @@
           <Label class="mb-2">Downstream Caches</Label>
           <TagsInput
             placeholder="Add a downstream cache"
+            disabled={readonly}
             bind:value={downstreamCaches}
             suggestions={[
               'https://cache.nixos.org/',

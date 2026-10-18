@@ -2,7 +2,12 @@ use aide::axum::{
   ApiRouter,
   routing::{get_with, put_with},
 };
-use axum::{Json, extract::Path};
+use axum::{
+  Json,
+  extract::{Path, Request},
+  middleware::{self, Next},
+  response::Response,
+};
 use centaurus::{
   backend::{
     auth::{
@@ -29,7 +34,13 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-  db::{DBTrait, cache::SimpleCacheInfo, group_ext::CacheMapping, user_ext::DetailUserInfo},
+  auth::cli_auth::CliTokenCache,
+  db::{
+    DBTrait,
+    cache::SimpleCacheInfo,
+    group_ext::{CacheMapping, same_mappings},
+    user_ext::DetailUserInfo,
+  },
   nix::NixCache,
   utils::{CacheEdit, UpdateMessage, Updater},
 };
@@ -45,7 +56,10 @@ fn management() -> ApiRouter {
   ApiRouter::new()
     .api_route("/", list_users_route())
     .api_route("/", create_user_route::<UpdateMessage>())
-    .api_route("/", delete_user_route::<UpdateMessage>())
+    .api_route(
+      "/",
+      delete_user_route::<UpdateMessage>().layer(middleware::from_fn(clear_auth_caches)),
+    )
     .api_route("/mail", mail_active_route())
     .api_route("/groups", list_groups_simple_route())
     .api_route("/avatar", reset_user_avatar_route::<UpdateMessage>())
@@ -58,6 +72,19 @@ fn management() -> ApiRouter {
       "/caches",
       get_with(list_caches_simple, |op| op.id("listCachesSimple")),
     )
+}
+
+/// The centaurus delete route knows nothing about our auth caches: drop them so a deleted user's cached CLI
+/// tokens and cache access stop working immediately instead of after `LOOKUP_TTL`.
+pub(crate) async fn clear_auth_caches(req: Request, next: Next) -> Response {
+  let tokens = req.extensions().get::<CliTokenCache>().cloned();
+  let nix = req.extensions().get::<NixCache>().cloned();
+  let res = next.run(req).await;
+  if res.status().is_success() {
+    tokens.inspect(CliTokenCache::clear);
+    nix.inspect(NixCache::clear);
+  }
+  res
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -137,10 +164,12 @@ async fn edit_user(
   };
 
   // only allow changing cache mappings if the user has the general cache edit permission
-  if user.caches != req.caches && !self_permissions.contains(&CacheEdit::name().to_string()) {
+  if !same_mappings(&user.caches, &req.caches)
+    && !self_permissions.contains(&CacheEdit::name().to_string())
+  {
     bail!(
       FORBIDDEN,
-      "Cannot edit cache mappings via the group edit endpoint"
+      "Cannot edit cache mappings without the cache edit permission"
     );
   }
 

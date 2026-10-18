@@ -3,7 +3,7 @@
   import FormDialog from '@profidev/pleiades/components/form/form-dialog.svelte';
   import Plus from '@lucide/svelte/icons/plus';
   import Table from '@profidev/pleiades/components/table/clean-table.svelte';
-  import { columns } from './table.svelte';
+  import { columns, searchable } from './table.svelte';
   import { z } from 'zod';
   import { toast } from '@profidev/pleiades/components/util/general';
   import { afterNavigate, invalidate } from '$app/navigation';
@@ -56,7 +56,7 @@
       return { error: 'Failed to delete user' };
     } else {
       toast.success(`User ${selected.name} deleted successfully`);
-      invalidate((url) => url.pathname.startsWith('/api/users'));
+      invalidate((url) => url.pathname.startsWith('/api/user/management'));
     }
   };
 
@@ -79,14 +79,14 @@
     </Button>
   </div>
   <Table
-    data={data.users}
+    data={data.users.then(searchable)}
     {columns}
     class="mt-4"
     columnData={{
       deleteUser: startDeleteUser,
       canEdit
     }}
-    searchColumns={['email', 'groups', 'name', 'uuid']}
+    searchColumns={['email', 'group_names', 'name', 'uuid']}
   />
 </div>
 <FormDialog

@@ -64,12 +64,15 @@ permission!(CacheEdit, "cache:edit");
 pub fn client() -> Client {
   Client::builder()
     .user_agent(format!("Hibernation v{}", env!("CARGO_PKG_VERSION")))
+    // Used for downstream cache checks, a hanging downstream must not stall pushes
+    .connect_timeout(Duration::from_secs(10))
+    .timeout(Duration::from_secs(10))
     .build()
     .expect("Failed to build HTTP client")
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
   use super::*;
 
   #[test]
@@ -81,5 +84,20 @@ mod tests {
     assert_eq!(fresh(&map, &"new"), Some(1));
     assert_eq!(fresh(&map, &"old"), None);
     assert_eq!(fresh(&map, &"missing"), None);
+  }
+
+  #[test]
+  fn permissions_include_centaurus_and_cache_perms() {
+    let perms = permissions();
+    assert_eq!(perms.len(), permission::permissions().len() + 3);
+    for perm in [
+      "cache:create",
+      "cache:view",
+      "cache:edit",
+      "user:edit",
+      "group:view",
+    ] {
+      assert!(perms.contains(&perm), "{perm}");
+    }
   }
 }

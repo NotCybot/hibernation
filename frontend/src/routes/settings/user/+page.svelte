@@ -198,7 +198,7 @@
       <Button
         class="ml-auto cursor-pointer"
         type="submit"
-        disabled={isLoading}
+        disabled={isLoading || readonly}
         variant={isError ? 'destructive' : undefined}
       >
         {#if isLoading}

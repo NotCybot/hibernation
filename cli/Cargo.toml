@@ -43,3 +43,17 @@ tracing-indicatif = "0.3.14"
 tracing-subscriber = "0.3.23"
 url = { version = "2.5.8", features = ["serde"] }
 uuid = { version = "1.23.1", features = ["serde", "v4"] }
+
+# Optional deps only used by the `e2e` integration test (tests/e2e.rs), which runs the real backend in-process.
+# Dev-dependencies can not be optional and the nix build has no backend sources, so they live here behind a feature.
+backend = { path = "../backend", features = ["test"], optional = true }
+base64 = { version = "0.23.0", optional = true }
+rsa = { version = "0.9.10", optional = true }
+
+[features]
+e2e = ["dep:backend", "dep:base64", "dep:rsa"]
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["test-util"] }
+wiremock = "0.6.5"

@@ -12,6 +12,12 @@ pub struct CacheEvictionState {
   cache_locks: Arc<DashMap<Uuid, Arc<Mutex<()>>>>,
 }
 
+impl Default for CacheEvictionState {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl CacheEvictionState {
   pub fn new() -> Self {
     Self {

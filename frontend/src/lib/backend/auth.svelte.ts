@@ -27,7 +27,7 @@ const _ = fetchKey();
 
 export const getOidcUrl = async (redirect?: string) => {
   const res = await get<{ url: string }>(
-    `/api/auth/oidc/url${redirect ? `?redirect_to=${redirect}` : ''}`,
+    `/api/auth/oidc/url${redirect ? `?redirect_to=${encodeURIComponent(redirect)}` : ''}`,
     {
       res_type: ResponseType.Json
     }

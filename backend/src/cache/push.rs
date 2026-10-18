@@ -117,8 +117,7 @@ impl PushState {
       async move {
         loop {
           sleep(Duration::from_secs(60)).await;
-          let now = Instant::now();
-          pending_uploads.retain(|_, u| now.duration_since(u.touched) < Duration::from_secs(300));
+          prune_expired(&pending_uploads, Instant::now());
         }
       }
     });
@@ -128,6 +127,21 @@ impl PushState {
       upload_limit: Arc::new(Semaphore::new(max_concurrent_uploads)),
     }
   }
+}
+
+const SESSION_TTL: Duration = Duration::from_secs(300);
+
+fn prune_expired(pending_uploads: &DashMap<Uuid, PendingUpload>, now: Instant) {
+  pending_uploads.retain(|_, u| now.duration_since(u.touched) < SESSION_TTL);
+}
+
+/// `{base}/{hash}.narinfo`. `Url::join` would replace the last path segment of a base without a trailing slash,
+/// e.g. a downstream cache at `https://host/api/nix/main` would be queried at `https://host/api/nix/<hash>.narinfo`
+fn narinfo_url(base: &str, hash: &str) -> Result<Url> {
+  Ok(Url::parse(&format!(
+    "{}/{hash}.narinfo",
+    base.trim_end_matches('/')
+  ))?)
 }
 
 fn nar_name(nar_id: Uuid) -> StoragePath {
@@ -224,9 +238,7 @@ async fn upload_info(
     let mut futures = Vec::new();
 
     for path in missing_paths {
-      let url = Url::parse(&downstream.url)
-        .unwrap()
-        .join(&format!("{}.narinfo", path.hash()))?;
+      let url = narinfo_url(&downstream.url, &path.hash().to_string())?;
       let req = client.head(url).build()?;
       let res_future = client.execute(req);
 
@@ -326,9 +338,7 @@ async fn upload_path(
     let mut downstream_caches = db.cache().downstream_caches(cache.id).await?;
     let client = client();
     while let Some(downstream) = downstream_caches.pop() {
-      let url = Url::parse(&downstream.url)
-        .unwrap()
-        .join(&format!("{}.narinfo", store_path.hash()))?;
+      let url = narinfo_url(&downstream.url, &store_path.hash().to_string())?;
       let req = client.head(url).build()?;
       if let Ok(res) = client.execute(req).await
         && let Ok(res) = res.error_for_status()
@@ -846,5 +856,97 @@ mod tests {
     assert!(state.upload_limit.try_acquire().is_err());
     drop(permits);
     assert!(state.upload_limit.try_acquire().is_ok());
+  }
+
+  #[tokio::test]
+  async fn prunes_sessions_idle_for_ttl() {
+    let pending_uploads = DashMap::new();
+    let now = Instant::now();
+    let mut old = pending(b"", 0);
+    old.touched = now - SESSION_TTL;
+    let mut fresh = pending(b"", 0);
+    fresh.touched = now - SESSION_TTL + Duration::from_secs(1);
+    let (old_id, fresh_id) = (Uuid::new_v4(), Uuid::new_v4());
+    pending_uploads.insert(old_id, old);
+    pending_uploads.insert(fresh_id, fresh);
+
+    prune_expired(&pending_uploads, now);
+
+    assert!(!pending_uploads.contains_key(&old_id));
+    assert!(pending_uploads.contains_key(&fresh_id));
+  }
+
+  #[test]
+  fn narinfo_url_keeps_base_path() {
+    for (base, expected) in [
+      (
+        "https://cache.nixos.org",
+        "https://cache.nixos.org/abc.narinfo",
+      ),
+      (
+        "https://cache.nixos.org/",
+        "https://cache.nixos.org/abc.narinfo",
+      ),
+      (
+        "http://host/api/nix/main",
+        "http://host/api/nix/main/abc.narinfo",
+      ),
+      (
+        "http://host/api/nix/main/",
+        "http://host/api/nix/main/abc.narinfo",
+      ),
+    ] {
+      assert_eq!(narinfo_url(base, "abc").unwrap().as_str(), expected);
+    }
+    assert!(narinfo_url("not a url", "abc").is_err());
+  }
+
+  #[tokio::test]
+  async fn rejects_empty_parts() {
+    let (storage, dir) = local_storage().await;
+    let upload = pending(&nar(), 0);
+    let req = UploadFinishRequest {
+      file_hash: String::new(),
+      file_size: 0,
+    };
+    assert!(store_upload(&storage, &upload, &req).await.is_err());
+    let _ = std::fs::remove_dir_all(dir);
+  }
+
+  #[tokio::test]
+  async fn rejects_finish_hash_or_size_mismatch() {
+    let (storage, dir) = local_storage().await;
+    let nar = nar();
+    let file = zstd::encode_all(&nar[..], 3).unwrap();
+    for req in [
+      UploadFinishRequest {
+        file_hash: hash(b"other"),
+        file_size: file.len() as u64,
+      },
+      UploadFinishRequest {
+        file_hash: hash(&file),
+        file_size: file.len() as u64 + 1,
+      },
+    ] {
+      let upload = pending(&nar, 1);
+      storage
+        .save_file(&mut &file[..], part_name(upload.nar_id, 0))
+        .await
+        .unwrap();
+      assert!(store_upload(&storage, &upload, &req).await.is_err());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+  }
+
+  #[test]
+  fn nar_hasher_counts_and_limits() {
+    let mut hasher = NarHasher {
+      hasher: Sha256::new(),
+      size: 0,
+      max_size: 4,
+    };
+    assert_eq!(hasher.write(b"abcd").unwrap(), 4);
+    hasher.flush().unwrap();
+    assert!(hasher.write(b"e").is_err());
   }
 }

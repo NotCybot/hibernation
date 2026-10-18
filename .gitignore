@@ -7,3 +7,5 @@ storage/
 /test/
 /result
 /*.key
+.devenv*
+devenv.local.nix

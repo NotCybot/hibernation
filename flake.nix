@@ -58,6 +58,8 @@
 
           RUSTFLAGS = "--cfg reqwest_unstable";
           buildAndTestSubdir = "cli";
+          # reqwest refuses to build a client without CA certificates, the sandbox has none
+          nativeCheckInputs = [ pkgs.cacert ];
 
           cargoLock = {
             lockFile = ./Cargo.lock;

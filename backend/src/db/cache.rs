@@ -86,10 +86,8 @@ impl<'db> CacheTable<'db> {
   }
 
   pub async fn list_caches(&self, user: Uuid) -> Result<Vec<CacheInfo>> {
-    let mut query = cache::Entity::find()
-      .join(JoinType::LeftJoin, cache::Relation::NarInfo.def())
-      .join(JoinType::LeftJoin, nar_info::Relation::Nar.def())
-      .join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
+    let mut query =
+      cache::Entity::find().join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
 
     query = apply_user_filter(query, self.db, user, AccessType::View).await?;
 
@@ -98,7 +96,7 @@ impl<'db> CacheTable<'db> {
         .group_by(cache::Column::Id)
         .select_only()
         .columns(cache::Column::iter())
-        .column_as(nar::Column::Size.sum().cast_as("BIGINT"), "size")
+        .column_as(size_subquery(), "size")
         .into_model::<CacheInfo>()
         .all(self.db)
         .await?,
@@ -125,19 +123,29 @@ impl<'db> CacheTable<'db> {
   pub async fn cache_details(&self, uuid: Uuid, user: Uuid) -> Result<Option<CacheDetails>> {
     let access = self.cache_user_access(user, uuid).await?;
 
-    let mut query = cache::Entity::find_by_id(uuid)
-      .join(JoinType::LeftJoin, cache::Relation::NarInfo.def())
-      .join(JoinType::LeftJoin, nar_info::Relation::Nar.def())
-      .join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
+    let mut query =
+      cache::Entity::find_by_id(uuid).join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
 
     query = apply_user_filter(query, self.db, user, AccessType::View).await?;
+
+    let nar_count = Query::select()
+      .expr(nar_info::Column::Id.count().cast_as("BIGINT"))
+      .from(nar_info::Entity)
+      .and_where(
+        Expr::col((nar_info::Entity, nar_info::Column::CacheId))
+          .equals((cache::Entity, cache::Column::Id)),
+      )
+      .to_owned();
 
     let res = query
       .group_by(cache::Column::Id)
       .select_only()
       .columns(cache::Column::iter())
-      .column_as(nar::Column::Size.sum().cast_as("BIGINT"), "size")
-      .column_as(nar_info::Column::Id.count().cast_as("BIGINT"), "nar_count")
+      .column_as(size_subquery(), "size")
+      .column_as(
+        Expr::SubQuery(None, Box::new(nar_count.into())),
+        "nar_count",
+      )
       .column_as(
         Expr::val(access == Some(AccessType::Edit)),
         "has_write_access",
@@ -204,8 +212,9 @@ impl<'db> CacheTable<'db> {
     user: Uuid,
     access_type: AccessType,
   ) -> Result<Option<cache::Model>> {
+    // Case-insensitive like `by_name`, names only differing in case can not be created
     let mut query = cache::Entity::find()
-      .filter(cache::Column::Name.eq(name))
+      .filter(Func::lower(Expr::col(cache::Column::Name)).eq(name.to_lowercase()))
       .join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
 
     query = apply_user_filter(query, self.db, user, access_type).await?;
@@ -466,6 +475,24 @@ impl<'db> CacheTable<'db> {
   }
 }
 
+/// Summed nar size of the outer query's cache. A subquery instead of joins, the cache_access join needed for the
+/// permission filter would otherwise multiply the sum by the number of access rows
+fn size_subquery() -> Expr {
+  let query = Query::select()
+    .expr(nar::Column::Size.sum().cast_as("BIGINT"))
+    .from(nar_info::Entity)
+    .inner_join(
+      nar::Entity,
+      Expr::col((nar_info::Entity, nar_info::Column::NarId)).equals((nar::Entity, nar::Column::Id)),
+    )
+    .and_where(
+      Expr::col((nar_info::Entity, nar_info::Column::CacheId))
+        .equals((cache::Entity, cache::Column::Id)),
+    )
+    .to_owned();
+  Expr::SubQuery(None, Box::new(query.into()))
+}
+
 fn serialize_i64_or_zero<S>(
   num: &Option<i64>,
   serializer: S,
@@ -519,4 +546,22 @@ async fn apply_user_filter<Q: QueryFilter>(
   };
 
   Ok(query)
+}
+
+#[cfg(test)]
+mod test {
+  use super::*;
+
+  #[test]
+  fn size_serializes_missing_as_zero() {
+    let info = |size| CacheInfo {
+      id: Uuid::nil(),
+      name: "main".into(),
+      size,
+      quota: 1,
+      public: true,
+    };
+    assert_eq!(serde_json::to_value(info(None)).unwrap()["size"], 0);
+    assert_eq!(serde_json::to_value(info(Some(42))).unwrap()["size"], 42);
+  }
 }

@@ -184,9 +184,13 @@ async fn edit_token(
     bail!(CONFLICT, "A token with this name already exists");
   }
 
-  db.token()
+  if !db
+    .token()
     .update(auth.user_id, req.uuid, req.name, req.exp.naive_utc())
-    .await?;
+    .await?
+  {
+    bail!(NOT_FOUND, "Token not found");
+  }
   token_cache.invalidate(req.uuid);
   updater
     .send_to(auth.user_id, UpdateMessage::Token { uuid: req.uuid })
@@ -204,13 +208,19 @@ async fn token_regenerate(
   db: Connection,
   pw: PasswordState,
   token_cache: CliTokenCache,
+  updater: Updater,
   Path(path): Path<TokenViewPath>,
 ) -> Result<Json<TokenRegenerateResponse>> {
   let token = cli::gen_token();
   let hash = pw.pw_hash_raw("", &token)?;
 
-  db.token().replace(auth.user_id, path.uuid, hash).await?;
+  if !db.token().replace(auth.user_id, path.uuid, hash).await? {
+    bail!(NOT_FOUND, "Token not found");
+  }
   token_cache.invalidate(path.uuid);
+  updater
+    .send_to(auth.user_id, UpdateMessage::Token { uuid: path.uuid })
+    .await;
 
   Ok(Json(TokenRegenerateResponse { token }))
 }

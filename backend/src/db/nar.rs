@@ -1,11 +1,9 @@
 use std::collections::HashSet;
 
-use centaurus::error::ErrorReportStatusExt;
 use chrono::Utc;
 use entity::{nar, nar_info, nar_info_reference, nar_upload};
 use harmonia_store_core::store_path::StorePath;
-use http::StatusCode;
-use migration::ExprTrait;
+use migration::{ExprTrait, Func, LikeExpr};
 use schemars::JsonSchema;
 use sea_orm::{
   ActiveValue::Set, FromQueryResult, IntoActiveModel, JoinType, QueryOrder, QuerySelect,
@@ -132,7 +130,18 @@ impl<'db> NarTable<'db> {
         })
       })
       .await
-      .status_context(StatusCode::INTERNAL_SERVER_ERROR, "DB Error")
+      .map_err(|e| match e {
+        // A concurrent push of the same path won the race (unique cache_id + store_path_hash)
+        sea_orm::TransactionError::Transaction(e)
+          if matches!(
+            e.sql_err(),
+            Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+          ) =>
+        {
+          centaurus::anyhow!(BAD_REQUEST, "Store path is already in the cache")
+        }
+        e => centaurus::anyhow!(INTERNAL_SERVER_ERROR, "DB Error: {e}"),
+      })
   }
 
   pub async fn is_store_path_in_cache(&self, cache: Uuid, store_path: &str) -> Result<bool, DbErr> {
@@ -301,11 +310,13 @@ impl<'db> NarTable<'db> {
       .await
   }
 
-  /// Only referenced nars, so dedupe never keeps an orphan the cleanup is about to delete
+  /// Only referenced nars, so dedupe never keeps an orphan the cleanup is about to delete.
+  /// Oldest first (v7 ids), so dedupe keeps the nar the earliest narinfo URLs point at
   pub async fn find_nars_by_nar_hash(&self, nar_hash: &str) -> Result<Vec<Uuid>, DbErr> {
     nar::Entity::find()
       .select_only()
       .column(nar::Column::Id)
+      .order_by_asc(nar::Column::Id)
       .filter(nar::Column::NarHash.eq(nar_hash))
       .filter(
         nar::Column::Id.in_subquery(
@@ -391,7 +402,21 @@ impl<'db> NarTable<'db> {
   ) -> Result<Vec<SearchResult>, DbErr> {
     let mut query = nar_info::Entity::find()
       .filter(nar_info::Column::CacheId.eq(cache))
-      .filter(nar_info::Column::StorePath.contains(query.trim().to_lowercase()))
+      // `contains` is a case-sensitive LIKE on Postgres, lower both sides so search is case-insensitive everywhere
+      .filter(
+        Func::lower(Expr::col((nar_info::Entity, nar_info::Column::StorePath))).like(
+          LikeExpr::new(format!(
+            "%{}%",
+            query
+              .trim()
+              .to_lowercase()
+              .replace('\\', "\\\\")
+              .replace('%', "\\%")
+              .replace('_', "\\_")
+          ))
+          .escape('\\'),
+        ),
+      )
       .join(JoinType::LeftJoin, nar_info::Relation::Nar.def());
 
     let order = match order {

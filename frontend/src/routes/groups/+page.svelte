@@ -3,7 +3,7 @@
   import FormDialog from '@profidev/pleiades/components/form/form-dialog.svelte';
   import Plus from '@lucide/svelte/icons/plus';
   import Table from '@profidev/pleiades/components/table/clean-table.svelte';
-  import { columns } from './table.svelte';
+  import { columns, searchable } from './table.svelte';
   import { z } from 'zod';
   import { toast } from '@profidev/pleiades/components/util/general';
   import { afterNavigate, invalidate } from '$app/navigation';
@@ -63,7 +63,7 @@
       return { error: 'Failed to delete group' };
     } else {
       toast.success(`Group ${selected.name} deleted successfully`);
-      invalidate((url) => url.pathname.startsWith('/api/groups'));
+      invalidate((url) => url.pathname.startsWith('/api/group'));
     }
   };
 
@@ -86,7 +86,7 @@
     </Button>
   </div>
   <Table
-    data={data.groups}
+    data={data.groups.then(searchable)}
     {columns}
     class="mt-4"
     columnData={{
@@ -94,7 +94,7 @@
       user,
       admin_group: adminGroup
     }}
-    searchColumns={['id', 'name', 'permissions', 'users']}
+    searchColumns={['id', 'name', 'permissions', 'user_names']}
   />
 </div>
 <FormDialog

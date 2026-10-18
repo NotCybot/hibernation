@@ -7,5 +7,17 @@
     "frontend/src/lib/components/code/**",
     "action/dist/**",
     "vite.config.ts"
+  ],
+  "overrides": [
+    {
+      "files": ["**/src/tests/**"],
+      "rules": {
+        "typescript/no-unsafe-type-assertion": "off",
+        "unicorn/no-null": "off",
+        "typescript/explicit-member-accessibility": "off",
+        "eslint/class-methods-use-this": "off",
+        "unicorn/consistent-function-scoping": "off"
+      }
+    }
   ]
 }

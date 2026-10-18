@@ -32,7 +32,9 @@ export const disconnectWebsocket = () => socket.disconnect();
 const handleMessage = (msg: UpdateMessage, user: string) => {
   switch (msg.type) {
     case UpdateType.Settings: {
-      const _ = invalidate((url) => url.pathname.startsWith('/api/settings'));
+      invalidate((url) => url.pathname.startsWith('/api/settings')).catch(
+        () => {}
+      );
       break;
     }
     case UpdateType.User: {

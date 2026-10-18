@@ -1,16 +1,38 @@
 import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 import { enhancedImages } from '@sveltejs/enhanced-img';
+import { svelteTesting } from '@testing-library/svelte/vite';
 
 export default defineConfig({
   define: {
     __version__: JSON.stringify(process.env.npm_package_version)
   },
-  plugins: [enhancedImages(), tailwindcss(), sveltekit()],
+  plugins: [enhancedImages(), tailwindcss(), sveltekit(), svelteTesting()],
+  resolve: process.env.VITEST
+    ? {
+        conditions: ['browser']
+      }
+    : undefined,
   server: {
     hmr: {
       port: 5174
     }
+  },
+  test: {
+    clearMocks: true,
+    coverage: {
+      exclude: ['src/lib/client/**', 'src/tests/**'],
+      include: ['src/**/*.{ts,svelte}'],
+      provider: 'v8',
+      reporter: ['text', 'html', 'lcov']
+    },
+    environment: 'jsdom',
+    include: ['src/tests/unit/**/*.{test,spec}.{js,ts}'],
+    setupFiles: [
+      './src/tests/setup/vitest-setup.ts',
+      './src/tests/setup/vitest-setup-sveltekit.ts',
+      './src/tests/mocks/setup.ts'
+    ]
   }
 });

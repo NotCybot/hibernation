@@ -52,6 +52,10 @@ impl CliTokenCache {
   pub fn invalidate(&self, token_id: Uuid) {
     self.tokens.retain(|_, (_, token)| token.id != token_id);
   }
+
+  pub fn clear(&self) {
+    self.tokens.clear();
+  }
 }
 
 #[derive(Debug, OperationIo)]
@@ -84,7 +88,7 @@ impl<S: Sync, P: Permission> FromRequestParts<S> for CliAuth<P> {
       let state = parts.extract_state::<JwtState>().await;
 
       let Ok(claims) = state.validate_token(&token) else {
-        tracing::error!("invalid token claims for token: {}", token);
+        tracing::debug!("invalid token claims");
         bail!(UNAUTHORIZED, "invalid token");
       };
       state.auth.check(&db, parts, &token, &claims).await?;
