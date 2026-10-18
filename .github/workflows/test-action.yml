@@ -3,6 +3,19 @@ on:
   pull_request:
 
 jobs:
+  unit-test:
+    name: Unit test setup action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: bahmutov/npm-install@v1
+      - name: Run unit tests
+        run: cd action && npm run test:coverage
+      - name: Check dist is up to date
+        run: |
+          cd action && npm run build
+          git diff --exit-code -- dist/index.cjs
+
   test-setup:
     runs-on: ${{ matrix.os }}
     strategy:
