@@ -122,6 +122,24 @@ impl<'db> CacheTable<'db> {
     )
   }
 
+  pub async fn edit_cache_ids(&self, user: Uuid) -> Result<Vec<Uuid>> {
+    let mut query =
+      cache::Entity::find().join(JoinType::LeftJoin, cache::Relation::CacheAccess.def());
+
+    query = apply_user_filter(query, self.db, user, AccessType::Edit).await?;
+
+    Ok(
+      query
+        .select_only()
+        .column(cache::Column::Id)
+        // the cache_access join yields one row per access entry
+        .distinct()
+        .into_tuple::<Uuid>()
+        .all(self.db)
+        .await?,
+    )
+  }
+
   pub async fn cache_details(&self, uuid: Uuid, user: Uuid) -> Result<Option<CacheDetails>> {
     let access = self.cache_user_access(user, uuid).await?;
 

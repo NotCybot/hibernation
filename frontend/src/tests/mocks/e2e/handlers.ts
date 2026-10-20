@@ -52,6 +52,7 @@ export const handlers = [
   gen.handleListTokens(({ cookies }) => j(data.tokens[scn(cookies)])),
   gen.handleListGroups(({ cookies }) => j(data.groups[scn(cookies)])),
   gen.handleListUsers(({ cookies }) => j(data.users[scn(cookies)])),
+  gen.handleCacheOverview(({ cookies }) => j(data.overview[scn(cookies)])),
   gen.handleSearchStorePaths(({ cookies }) =>
     j(data.searchResults[scn(cookies)])
   ),

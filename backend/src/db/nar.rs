@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use chrono::Utc;
-use entity::{nar, nar_info, nar_info_reference, nar_upload};
+use entity::{cache, nar, nar_info, nar_info_reference, nar_upload};
 use harmonia_store_core::store_path::StorePath;
 use migration::{ExprTrait, Func, LikeExpr};
 use schemars::JsonSchema;
@@ -34,6 +34,19 @@ pub struct SearchResult {
   pub size: i64,
   pub accessed: i64,
 }
+
+#[derive(FromQueryResult)]
+pub struct OverviewPath {
+  pub cache_id: Uuid,
+  pub cache_name: String,
+  pub store_path: String,
+  pub created_at: chrono::NaiveDateTime,
+  pub last_accessed_at: chrono::NaiveDateTime,
+  pub size: i64,
+  pub accessed: i64,
+}
+
+const OVERVIEW_LIMIT: u64 = 10;
 
 #[derive(FromQueryResult)]
 pub struct NarInfoData {
@@ -451,6 +464,23 @@ impl<'db> NarTable<'db> {
       .await
   }
 
+  pub async fn most_accessed_paths(&self, caches: Vec<Uuid>) -> Result<Vec<OverviewPath>, DbErr> {
+    overview_query(caches)
+      .filter(nar_info::Column::Accessed.gt(0))
+      .order_by_desc(nar_info::Column::Accessed)
+      .into_model::<OverviewPath>()
+      .all(self.db)
+      .await
+  }
+
+  pub async fn recent_paths(&self, caches: Vec<Uuid>) -> Result<Vec<OverviewPath>, DbErr> {
+    overview_query(caches)
+      .order_by_desc(nar_info::Column::CreatedAt)
+      .into_model::<OverviewPath>()
+      .all(self.db)
+      .await
+  }
+
   pub async fn delete_path(&self, cache: Uuid, store_path: &str) -> Result<(), DbErr> {
     nar_info::Entity::delete_many()
       .filter(nar_info::Column::CacheId.eq(cache))
@@ -532,4 +562,21 @@ impl<'db> NarTable<'db> {
 
     Ok(())
   }
+}
+
+/// Paths of `caches` with their cache name and size, the caller adds filter and order
+fn overview_query(caches: Vec<Uuid>) -> Select<nar_info::Entity> {
+  nar_info::Entity::find()
+    .filter(nar_info::Column::CacheId.is_in(caches))
+    .join(JoinType::InnerJoin, nar_info::Relation::Nar.def())
+    .join(JoinType::InnerJoin, nar_info::Relation::Cache.def())
+    .select_only()
+    .column(nar_info::Column::CacheId)
+    .column_as(cache::Column::Name, "cache_name")
+    .column(nar_info::Column::StorePath)
+    .column(nar_info::Column::CreatedAt)
+    .column(nar_info::Column::LastAccessedAt)
+    .column(nar_info::Column::Accessed)
+    .column(nar::Column::Size)
+    .limit(OVERVIEW_LIMIT)
 }
