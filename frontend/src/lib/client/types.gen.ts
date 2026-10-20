@@ -55,6 +55,11 @@ export type CacheMapping = {
   uuid: string;
 };
 
+export type CacheOverview = {
+  most_accessed: Array<OverviewPath>;
+  recent_pushes: Array<OverviewPath>;
+};
+
 export type CachePath = {
   uuid: string;
 };
@@ -267,6 +272,16 @@ export type OidcSetupResponse = {
 
 export type OidcUrlQuery = {
   redirect_to?: string | null;
+};
+
+export type OverviewPath = {
+  accessed: number;
+  cache_name: string;
+  cache_uuid: string;
+  created_at: Date;
+  last_accessed_at: Date;
+  size: number;
+  store_path: string;
 };
 
 export type PasswordUpdate = {
@@ -1917,6 +1932,31 @@ export type CreateCacheResponses = {
 
 export type CreateCacheResponse2 =
   CreateCacheResponses[keyof CreateCacheResponses];
+
+export type CacheOverviewData = {
+  body?: never;
+  path?: never;
+  query?: never;
+  url: '/api/cache/management/overview';
+};
+
+export type CacheOverviewErrors = {
+  /**
+   * An error occurred
+   */
+  '4XX': unknown;
+  /**
+   * An error occurred
+   */
+  '5XX': unknown;
+};
+
+export type CacheOverviewResponses = {
+  200: CacheOverview;
+};
+
+export type CacheOverviewResponse =
+  CacheOverviewResponses[keyof CacheOverviewResponses];
 
 export type ClearCacheData = {
   body?: never;

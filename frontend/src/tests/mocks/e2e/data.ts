@@ -193,6 +193,34 @@ export const userDetails = {
   uuid: 'user-1'
 };
 
+export const overview = {
+  default: {
+    most_accessed: [
+      {
+        accessed: 3,
+        cache_name: 'main',
+        cache_uuid: 'cache-main',
+        created_at: '2026-01-01T00:00:00Z',
+        last_accessed_at: '2026-01-02T00:00:00Z',
+        size: 2048,
+        store_path: '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12'
+      }
+    ],
+    recent_pushes: [
+      {
+        accessed: 0,
+        cache_name: 'main',
+        cache_uuid: 'cache-main',
+        created_at: '2026-01-03T00:00:00Z',
+        last_accessed_at: '2026-01-03T00:00:00Z',
+        size: 4096,
+        store_path: '/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-ripgrep-14.1'
+      }
+    ]
+  },
+  empty: { most_accessed: [], recent_pushes: [] }
+};
+
 export const tokens = {
   default: [
     {

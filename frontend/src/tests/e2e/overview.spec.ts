@@ -21,6 +21,30 @@ test('overview page renders inside the app shell', async ({ page }) => {
   await expectNoHorizontalOverflow(page);
 });
 
+test('overview shows caches, tokens and paths', async ({ page }) => {
+  await gotoReady(page, '/');
+  const main = page.getByRole('main');
+
+  // Two mocked caches, only the `ci` token is not expired
+  await expect(main.locator('a[href="/caches/cache-private"]')).toBeVisible();
+  await expect(main.locator('a[href="/tokens/token-ci"]')).toBeVisible();
+  await expect(main.locator('a[href="/tokens/token-old"]')).toHaveCount(0);
+  await expect(main.getByText('ripgrep-14.1')).toBeVisible();
+  await expect(main.getByText('hello-2.12')).toBeVisible();
+  await expect(main.getByText('3×')).toBeVisible();
+});
+
+test('overview shows empty states', async ({ context, page }) => {
+  await setupSession(context, 'empty');
+  await gotoReady(page, '/');
+  const main = page.getByRole('main');
+
+  await expect(main.getByText('No caches yet.')).toBeVisible();
+  await expect(main.getByText('No active tokens.')).toBeVisible();
+  await expect(main.getByText('Nothing pushed yet.')).toBeVisible();
+  await expect(main.getByText('Nothing pulled yet.')).toBeVisible();
+});
+
 test('sidebar wires up the navigation targets', async ({ page }) => {
   await gotoReady(page, '/');
   await openSidebar(page);

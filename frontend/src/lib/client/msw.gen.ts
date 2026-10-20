@@ -14,6 +14,7 @@ import type {
   AuthenticateData,
   AvatarByIdResponses,
   CacheDetailsResponses,
+  CacheOverviewResponses,
   ChangeUserEmailData,
   ChangeUserEmailResponses,
   ClearCacheResponses,
@@ -1836,6 +1837,40 @@ export function handleCreateCache(
   );
 }
 
+export type HandleCacheOverviewResponse = {
+  body: CacheOverviewResponses[200];
+  status?: 200;
+};
+
+/**
+ * Handler for the `GET /api/cache/management/overview` operation.
+ */
+export function handleCacheOverview(
+  response?: HandleCacheOverviewResponse | HttpResponseResolver<never, never>,
+  options?: RequestHandlerOptions
+): HttpHandler {
+  return http.get<never, never>(
+    `${options?.baseUrl ?? '*'}/api/cache/management/overview`,
+    (info) => {
+      if (typeof response === 'function') {
+        return response(info);
+      }
+      const body = response?.body;
+      if (body !== undefined) {
+        return HttpResponse.json(body, { status: response?.status ?? 200 });
+      }
+      if (options?.responseFallback === 'passthrough') {
+        return;
+      }
+      return new Response('Not Implemented', {
+        status: 501,
+        statusText: 'Not Implemented'
+      });
+    },
+    options
+  );
+}
+
 export type HandleClearCacheResponse = {
   body: ClearCacheResponses[200];
   status?: 200;
@@ -2720,6 +2755,10 @@ export type MswHandlerFactories = {
    */
   createCache: typeof handleCreateCache;
   /**
+   * Handler for the `GET /api/cache/management/overview` operation.
+   */
+  cacheOverview: typeof handleCacheOverview;
+  /**
    * Handler for the `DELETE /api/cache/management/{uuid}` operation.
    */
   clearCache: typeof handleClearCache;
@@ -2859,6 +2898,7 @@ export function createMswHandlers(
     deleteCache: wrap(handleDeleteCache),
     listCaches: wrap(handleListCaches),
     createCache: wrap(handleCreateCache),
+    cacheOverview: wrap(handleCacheOverview),
     clearCache: wrap(handleClearCache),
     cacheDetails: wrap(handleCacheDetails),
     editCache: wrap(handleEditCache),
@@ -2905,6 +2945,7 @@ export function createMswHandlers(
       invoke(pick.updateAvatar, overrides.updateAvatar),
       invoke(pick.sendResetLink, overrides.sendResetLink),
       invoke(pick.resetPassword, overrides.resetPassword),
+      invoke(pick.cacheOverview, overrides.cacheOverview),
       invoke(pick.uploadInfo, overrides.uploadInfo),
       invoke(pick.userInfoDetail, overrides.userInfoDetail),
       invoke(pick.clearCache, overrides.clearCache),

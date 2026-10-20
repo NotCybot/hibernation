@@ -9,6 +9,7 @@ import type {
 } from './client';
 import { client } from './client.gen';
 import {
+  cacheOverviewResponseTransformer,
   listTokensResponseTransformer,
   searchStorePathsResponseTransformer,
   tokenInfoResponseTransformer
@@ -25,6 +26,9 @@ import type {
   CacheDetailsData,
   CacheDetailsErrors,
   CacheDetailsResponses,
+  CacheOverviewData,
+  CacheOverviewErrors,
+  CacheOverviewResponses,
   ChangeUserEmailData,
   ChangeUserEmailErrors,
   ChangeUserEmailResponses,
@@ -871,6 +875,19 @@ export const createCache = <ThrowOnError extends boolean = false>(
       'Content-Type': 'application/json',
       ...options.headers
     }
+  });
+
+export const cacheOverview = <ThrowOnError extends boolean = false>(
+  options?: Options<CacheOverviewData, ThrowOnError>
+): RequestResult<CacheOverviewResponses, CacheOverviewErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    CacheOverviewResponses,
+    CacheOverviewErrors,
+    ThrowOnError
+  >({
+    responseTransformer: cacheOverviewResponseTransformer,
+    url: '/api/cache/management/overview',
+    ...options
   });
 
 export const clearCache = <ThrowOnError extends boolean = false>(

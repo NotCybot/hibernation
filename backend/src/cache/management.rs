@@ -21,7 +21,7 @@ use crate::{
   db::{
     DBTrait,
     cache::{CacheDetails, CacheInfo},
-    nar::{SearchOrder, SearchSort},
+    nar::{self, SearchOrder, SearchSort},
   },
   nix::NixCache,
   utils::CacheCreate,
@@ -33,6 +33,10 @@ pub fn router() -> ApiRouter {
     .api_route("/", get_with(list_caches, |op| op.id("listCaches")))
     .api_route("/", post_with(create_cache, |op| op.id("createCache")))
     .api_route("/", delete_with(delete_cache, |op| op.id("deleteCache")))
+    .api_route(
+      "/overview",
+      get_with(cache_overview, |op| op.id("cacheOverview")),
+    )
     .api_route(
       "/{uuid}",
       get_with(cache_details, |op| op.id("cacheDetails")),
@@ -85,6 +89,49 @@ impl CacheRegex {
 
 async fn list_caches(auth: JwtAuth, db: Connection) -> Result<Json<Vec<CacheInfo>>> {
   Ok(Json(db.cache().list_caches(auth.user_id).await?))
+}
+
+#[derive(Serialize, JsonSchema)]
+struct CacheOverview {
+  most_accessed: Vec<OverviewPath>,
+  recent_pushes: Vec<OverviewPath>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct OverviewPath {
+  cache_uuid: Uuid,
+  cache_name: String,
+  store_path: String,
+  created_at: DateTime<Utc>,
+  last_accessed_at: DateTime<Utc>,
+  size: i64,
+  accessed: i64,
+}
+
+impl From<nar::OverviewPath> for OverviewPath {
+  fn from(entry: nar::OverviewPath) -> Self {
+    Self {
+      cache_uuid: entry.cache_id,
+      cache_name: entry.cache_name,
+      store_path: entry.store_path,
+      created_at: DateTime::from_naive_utc_and_offset(entry.created_at, Utc),
+      last_accessed_at: DateTime::from_naive_utc_and_offset(entry.last_accessed_at, Utc),
+      size: entry.size,
+      accessed: entry.accessed,
+    }
+  }
+}
+
+/// Paths are only listed for caches with edit access, like the search
+async fn cache_overview(auth: JwtAuth, db: Connection) -> Result<Json<CacheOverview>> {
+  let caches = db.cache().edit_cache_ids(auth.user_id).await?;
+  let most_accessed = db.nar().most_accessed_paths(caches.clone()).await?;
+  let recent_pushes = db.nar().recent_paths(caches).await?;
+
+  Ok(Json(CacheOverview {
+    most_accessed: most_accessed.into_iter().map(Into::into).collect(),
+    recent_pushes: recent_pushes.into_iter().map(Into::into).collect(),
+  }))
 }
 
 #[derive(Deserialize, JsonSchema)]
